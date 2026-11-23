@@ -418,11 +418,14 @@ int main(int argc, char** argv)
       }
       bool all = b.pump([&] { return int(b.reflections.size()) >= burst; }, 20.0);
       double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      bool ordered = all;
-      for (int k = 0; all && k < burst; ++k)
-         ordered = ordered && str(b.reflections[k].values[position]) == std::to_string(k);
-      check(all && ordered, std::to_string(burst) + " updates received in order (" + std::to_string(int(burst / secs)) +
-                               " updates/s)");
+      int firstWrong = -1;
+      for (int k = 0; k < int(b.reflections.size()) && k < burst && firstWrong < 0; ++k)
+         if (str(b.reflections[k].values[position]) != std::to_string(k))
+            firstWrong = k;
+      check(all && firstWrong < 0,
+            std::to_string(burst) + " updates received in order (" + std::to_string(b.reflections.size()) +
+               " received in " + std::to_string(int(secs * 1000)) + " ms" +
+               (firstWrong >= 0 ? ", order broken at " + std::to_string(firstWrong) : std::string()) + ")");
 
       // ---------------------------------------------------------- resign
       expect<FederateOwnsAttributes>("resign NO_ACTION while owning an object -> FederateOwnsAttributes",
