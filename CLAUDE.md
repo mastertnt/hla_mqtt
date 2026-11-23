@@ -75,6 +75,10 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   et Debug (+3 exécutions) ; tous les tests précédents verts ; broker propre. Boucles 2 fédérés :
   ~160 pas/s (TAR, lookahead 1), ~140 pas/s (NER, lookahead 0). Non faits : retract, change*OrderType.
 
+## CI
+- `.github/workflows/ci.yml` : Windows (VS2022 v143, Release + Debug) et Linux (GCC 13), Conan 2, presets
+  `conan-*`, Mosquitto pour les tests (`broker/mosquitto-hla.conf`). Dépôt : github.com/mastertnt/hla_mqtt (public).
+
 ## Règles de concurrence
 - Le thread Paho ne prend que `_viewMutex`. Ne jamais appeler un service bloquant du transport (publish
   synchrone, subscribe, unsubscribe, barrier) en tenant `_viewMutex` : calculer l'état sous le verrou, agir après.

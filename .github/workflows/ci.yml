@@ -1,5 +1,6 @@
 # Build and test hla-mqtt-rti on Windows (MSVC) and Linux (GCC).
-# The tests need an MQTT broker: Mosquitto 2 with broker/mosquitto-hla.conf.
+# The tests need an MQTT broker: Mosquitto 2.
+# Failures are also reported as annotations (readable without signing in).
 name: CI
 
 on:
@@ -26,7 +27,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Release, Debug]
+        include:
+          - build_type: Release
+            preset: release
+          - build_type: Debug
+            preset: debug
     steps:
       - uses: actions/checkout@v4
 
@@ -53,22 +58,39 @@ jobs:
         run: cmake --preset conan-default
 
       - name: Build
-        run: cmake --build --preset conan-${{ matrix.build_type == 'Release' && 'release' || 'debug' }} --parallel
+        run: cmake --build --preset conan-${{ matrix.preset }} --parallel
 
       - name: Start Mosquitto
         shell: pwsh
         run: |
-          choco install mosquitto -y --no-progress
-          Stop-Service mosquitto -ErrorAction SilentlyContinue
-          Start-Process "C:\Program Files\mosquitto\mosquitto.exe" -ArgumentList '-c', "$PWD\broker\mosquitto-hla.conf" -WindowStyle Hidden
-          for ($i = 0; $i -lt 30; $i++) {
-            if ((Test-NetConnection localhost -Port 1883 -WarningAction SilentlyContinue).TcpTestSucceeded) { "broker up"; exit 0 }
-            Start-Sleep 1
+          choco install mosquitto -y --no-progress | Out-Host
+          function Test-Broker {
+            try { $c = [Net.Sockets.TcpClient]::new(); $c.Connect('127.0.0.1', 1883); $c.Close(); $true } catch { $false }
           }
-          throw "Mosquitto did not start"
+          $exe = Get-ChildItem 'C:\Program Files\mosquitto', 'C:\Program Files (x86)\mosquitto' -Filter mosquitto.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          # 1) the Windows service installed by the package (localhost, anonymous)
+          Start-Service mosquitto -ErrorAction SilentlyContinue
+          for ($i = 0; $i -lt 10 -and -not (Test-Broker); $i++) { Start-Sleep 1 }
+          # 2) otherwise the executable with the project configuration
+          if (-not (Test-Broker) -and $exe) {
+            $conf = Join-Path $PWD 'broker\mosquitto-hla.conf'
+            Start-Process $exe.FullName -ArgumentList '-c', "`"$conf`"", '-v' -RedirectStandardError mosquitto.log -WindowStyle Hidden
+            for ($i = 0; $i -lt 20 -and -not (Test-Broker); $i++) { Start-Sleep 1 }
+          }
+          if (Test-Broker) { 'broker up'; exit 0 }
+          $svc = Get-Service mosquitto -ErrorAction SilentlyContinue
+          Write-Output "::error::Mosquitto did not start (exe: $($exe.FullName); service: $($svc.Status))"
+          if (Test-Path mosquitto.log) { Get-Content mosquitto.log -Tail 5 | ForEach-Object { Write-Output "::error::$_" } }
+          exit 1
 
       - name: Test
-        run: ctest --preset conan-${{ matrix.build_type == 'Release' && 'release' || 'debug' }} --output-on-failure --timeout 300
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --preset conan-${{ matrix.preset }} --output-on-failure --timeout 300 2>&1 | tee ctest.log || {
+            grep -E '\[FAIL\]|Failed|Timeout|SOME TESTS|xception' ctest.log | head -9 | sed 's/^/::error::/'
+            exit 1
+          }
 
       - name: Exports of the RTI DLL
         if: matrix.build_type == 'Release'
@@ -132,12 +154,17 @@ jobs:
             if (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null; then echo "broker up"; exit 0; fi
             sleep 1
           done
-          docker logs mosquitto
+          docker logs mosquitto 2>&1 | tail -5 | sed 's/^/::error::/'
           exit 1
 
       - name: Test
-        run: ctest --preset conan-release --output-on-failure --timeout 300
+        run: |
+          set -o pipefail
+          ctest --preset conan-release --output-on-failure --timeout 300 2>&1 | tee ctest.log || {
+            grep -E '\[FAIL\]|Failed|Timeout|SOME TESTS|xception' ctest.log | head -9 | sed 's/^/::error::/'
+            exit 1
+          }
 
       - name: Broker log
         if: failure()
-        run: docker logs mosquitto | tail -100
+        run: docker logs mosquitto 2>&1 | tail -100
