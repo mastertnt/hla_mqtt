@@ -227,7 +227,7 @@ ALL TESTS PASSED (0 failure(s))
 
 | Job | Runner | Contenu |
 |---|---|---|
-| Windows MSVC Release, Debug | `windows-2022` (VS2022, v143) | Conan 2, build, Mosquitto (Chocolatey), `ctest`, exports de la DLL, artefacts `rti1516e.dll`/`fedtime1516e.dll` (Release) |
+| Windows MSVC Release, Debug | `windows-2022` (VS2022, v143) | Conan 2, build, Mosquitto (installateur officiel), `ctest`, exports de la DLL, artefacts `rti1516e.dll`/`fedtime1516e.dll` (Release) |
 | Linux GCC Release | `ubuntu-24.04` (GCC 13) | Conan 2, build, Mosquitto (conteneur `eclipse-mosquitto:2`), `ctest` |
 
 Le broker de la CI utilise `broker/mosquitto-hla.conf` et les tests lisent `HLA_MQTT_BROKER`.
