@@ -120,6 +120,21 @@ python tools\check_imports.py federe.exe build\bin\Release\rti1516e.dll
 Le script liste les symboles importés par le fédéré et absents de la DLL. La liste doit être vide pour un remplacement direct.
 Les symboles d'**encodage** (`RTI/encoding`) et des temps standard (`RTI/time`) sont dans `rti1516e.dll` ; `LogicalTimeFactoryFactory` est dans `fedtime1516e.dll`. Pour un fédéré qui importe aussi la DLL fedtime, lancer le script une seconde fois avec `build\bin\Release\fedtime1516e.dll`.
 
+### Diagnostic : HLA_MQTT_TRACE (Windows)
+
+`HLA_MQTT_TRACE=1` (ou un chemin de fichier) trace chaque exception HLA levée par la DLL, avec son type et son message, même quand le fédéré l'attrape. Indispensable quand un fédéré existant abandonne sans dire pourquoi.
+
+### Essai avec VR-Link 5.4 (MÄK)
+
+Testé avec `f18HLA1516e_64.exe` (publie un F-18, FOM RPR) et `netdumpHLA1516e_64.exe` (affiche les entités et leurs mises à jour), sans les recompiler :
+
+- `check_imports.py` : 0 symbole manquant pour les 6 modules VR-Link qui importent le RTI (dont 126 symboles pour `vlHLA1516e.dll`).
+- Construire la DLL sous les noms attendus : `-DHLA_MQTT_RTI_LIBRARY_NAME=librti1516e64 -DHLA_MQTT_FEDTIME_LIBRARY_NAME=libfedtime1516e64`, puis mettre ce dossier dans le `PATH` des fédérés.
+- VR-Link vérifie la « version du compilateur du RTI » en lisant la version de l'éditeur de liens dans l'en-tête PE de la DLL (14.00 attendu). Avec une DLL liée par VS2019 (14.29) : f18 s'arrête (contournable par `--noRtiCompilerCheck`), netdump plante (exception non attrapée). Mettre ce champ à 14.00 suffit.
+- Résultat : création de la fédération avec les modules RPR, join des deux fédérés, découverte de l'F-18 par netdump et réception de ses mises à jour (45 attributs RPR décodés).
+- Il faut aujourd'hui lancer f18 avec `--ignoreAdvisories` : VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance`, callback d'avis que le RTI n'émet pas encore.
+- Avertissements sans conséquence : dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes, faute de MIM standard chargé.
+
 ## Paramètres de connexion
 
 Ils passent par l'argument standard `localSettingsDesignator` de `connect()`, sans modification du fédéré :

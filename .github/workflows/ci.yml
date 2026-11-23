@@ -73,19 +73,22 @@ jobs:
           Start-Process .\mosquitto-setup.exe -ArgumentList '/S' -Wait
           $exe = Get-ChildItem 'C:\Program Files\mosquitto' -Filter mosquitto.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { Write-Output "::error::mosquitto.exe not found after installing $url"; exit 1 }
-          Stop-Service mosquitto -ErrorAction SilentlyContinue
-          $conf = Join-Path $PWD 'broker\mosquitto-hla.conf'
-          Start-Process $exe.FullName -ArgumentList '-c', "`"$conf`"" -RedirectStandardError mosquitto.log -WindowStyle Hidden
+          # As a Windows service: a process started by a step does not outlive the step.
+          Copy-Item (Join-Path $PWD 'broker\mosquitto-hla.conf') (Join-Path $exe.DirectoryName 'mosquitto.conf') -Force
+          if (-not (Get-Service mosquitto -ErrorAction SilentlyContinue)) { & $exe.FullName install | Out-Host }
+          Restart-Service mosquitto -ErrorAction SilentlyContinue
+          Start-Service mosquitto -ErrorAction SilentlyContinue
           for ($i = 0; $i -lt 20 -and -not (Test-Broker); $i++) { Start-Sleep 1 }
           if (Test-Broker) { 'broker up'; exit 0 }
-          Write-Output "::error::Mosquitto did not start ($($exe.FullName))"
-          if (Test-Path mosquitto.log) { Get-Content mosquitto.log -Tail 5 | ForEach-Object { Write-Output "::error::$_" } }
+          $svc = Get-Service mosquitto -ErrorAction SilentlyContinue
+          Write-Output "::error::Mosquitto did not start ($($exe.FullName), service: $($svc.Status))"
           exit 1
 
       - name: Test
         shell: bash
         run: |
           set -o pipefail
+          (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null || echo "::error::broker not reachable before the tests"
           ctest --preset conan-${{ matrix.preset }} --output-on-failure --timeout 300 2>&1 | tee ctest.log || {
             grep -E '\[FAIL\]|Failed|Timeout|SOME TESTS|xception' ctest.log | head -9 | sed 's/^/::error::/'
             exit 1
