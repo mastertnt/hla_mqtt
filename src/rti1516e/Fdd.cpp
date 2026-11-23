@@ -370,6 +370,13 @@ void Fdd::mergeInPlace(std::string const& xmlDocument, std::string const& label)
    if (XmlElement const* dims = root->child("dimensions"))
       for (XmlElement const* d : dims->childrenNamed("dimension"))
          b.dimension(*d);
+   if (XmlElement const* switches = root->child("switches"))
+      for (auto const& sw : switches->children)
+      {
+         auto it = sw->attributes.find("isEnabled");
+         if (it != sw->attributes.end() && !_switches.count(sw->name))
+            _switches[sw->name] = lower(trim(it->second)) == "true";
+      }
    if (XmlElement const* rates = root->child("updateRates"))
       for (XmlElement const* r : rates->childrenNamed("updateRate"))
          b.updateRate(*r);

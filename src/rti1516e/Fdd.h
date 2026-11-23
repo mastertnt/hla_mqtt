@@ -103,6 +103,12 @@ public:
 
    Dimension const* dimension(std::uint64_t handle) const;
    Dimension const* dimensionByName(std::string const& name) const;
+   // FOM <switches> (IEEE 1516-2010): value of the first module defining it.
+   bool switchEnabled(std::string const& name, bool defaultValue) const
+   {
+      auto it = _switches.find(name);
+      return it == _switches.end() ? defaultValue : it->second;
+   }
    // Update rate designator -> rate (Hz); false when unknown.
    bool updateRate(std::string const& name, double& rate) const;
 
@@ -121,6 +127,7 @@ private:
    std::map<std::uint64_t, Dimension> _dimensions;
    std::map<std::string, std::uint64_t> _dimensionByName;
    std::map<std::string, double> _updateRates;
+   std::map<std::string, bool> _switches;
 
    friend struct FddBuilder;
 };

@@ -140,6 +140,15 @@ void MqttRTIambassador::subscribeJoinedTopics()
       _syncPoints.clear();
       resetTime();
    }
+   {
+      // Advisory switches: FOM <switches>, disabled when absent.
+      std::lock_guard<std::mutex> v(_viewMutex);
+      _advisorySwitches[0] = _fdd->switchEnabled("objectClassRelevanceAdvisory", false);
+      _advisorySwitches[1] = _fdd->switchEnabled("attributeRelevanceAdvisory", false);
+      _advisorySwitches[2] = _fdd->switchEnabled("attributeScopeAdvisory", false);
+      _advisorySwitches[3] = _fdd->switchEnabled("interactionRelevanceAdvisory", false);
+   }
+   _transport->subscribe(ft + "/decl/+");
    _transport->subscribe(ft + "/sync/#");
    _transport->subscribe(ft + "/time/+");
    _transport->subscribe(ft + "/execution");
@@ -152,7 +161,7 @@ void MqttRTIambassador::subscribeJoinedTopics()
 void MqttRTIambassador::unsubscribeJoinedTopics() noexcept
 {
    std::string const ft = _fedTopic;
-   for (char const* t : {"/execution", "/fom/+", "/federates/+", "/classrequests/#", "/sync/#", "/time/+"})
+   for (char const* t : {"/execution", "/fom/+", "/federates/+", "/classrequests/#", "/sync/#", "/time/+", "/decl/+"})
       _transport->unsubscribe(ft + t);
    _transport->unsubscribe(ft + "/requests/" + hex64(_federateHandle));
    for (std::string const& t : _coverTopics)
@@ -170,6 +179,10 @@ void MqttRTIambassador::resetObjectState()
    _reservedNames.clear();
    _recent.clear();
    _recentOrder.clear();
+   _remoteDecl.clear();
+   _classRelevanceOn.clear();
+   _interactionRelevanceOn.clear();
+   _lastDeclarations.clear();
 }
 
 void MqttRTIambassador::updateBrokerSubscriptions()
@@ -217,6 +230,7 @@ void MqttRTIambassador::updateBrokerSubscriptions()
    _coverTopics = wanted;
    std::lock_guard<std::mutex> v(_viewMutex);
    discoverPending();
+   publishDeclarations();
 }
 
 // ============================================================ incoming traffic
@@ -233,6 +247,7 @@ void MqttRTIambassador::tryDiscover(ObjectInstance& o)
    ObjectClassHandle const known = ObjectClassHandleFriend::create(k);
    std::wstring const name = fromUtf8(o.name);
    enqueue([instance, known, name](FederateAmbassador& fa) { fa.discoverObjectInstance(instance, known, name); });
+   notifyScope(o);
 }
 
 void MqttRTIambassador::discoverPending()
@@ -308,6 +323,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          o.name = j["name"].str();
          o.owner = parseHex(j["owner"].str());
          o.ownerClient = j["clientId"].str();
+         for (std::string const& a : j["owned"].strings())
+            o.ownedRemote.insert(parseHex(a));
          o.topic = _fedTopic + "/" + rest.substr(0, rest.size() - 5);
          if (o.owner == _federateHandle || !_fdd->objectClass(o.objectClass))
             return;
@@ -320,6 +337,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          {
             it->second.owner = o.owner; // ownership change (divestiture)
             it->second.ownerClient = o.ownerClient;
+            it->second.ownedRemote = o.ownedRemote;
          }
          if (!it->second.locallyDeleted)
             tryDiscover(it->second);
@@ -532,6 +550,7 @@ void MqttRTIambassador::publishObjectClassAttributes(ObjectClassHandle theClass,
    HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, attributeList)
    forEachAttribute(attributeList,
                     [&](std::uint64_t av, AttributeHandle const&) { _publishedAttributes[theClassValue].insert(av); });
+   evaluateAdvisories();
 }
 
 // 5.3
@@ -542,6 +561,7 @@ void MqttRTIambassador::unpublishObjectClass(ObjectClassHandle theClass)
    std::lock_guard<std::mutex> v(_viewMutex);
    HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
    _publishedAttributes.erase(theClassValue);
+   evaluateAdvisories();
 }
 
 void MqttRTIambassador::unpublishObjectClassAttributes(ObjectClassHandle theClass,
@@ -558,6 +578,7 @@ void MqttRTIambassador::unpublishObjectClassAttributes(ObjectClassHandle theClas
    forEachAttribute(attributeList, [&](std::uint64_t av, AttributeHandle const&) { it->second.erase(av); });
    if (it->second.empty())
       _publishedAttributes.erase(it);
+   evaluateAdvisories();
 }
 
 // 5.4
@@ -570,6 +591,7 @@ void MqttRTIambassador::publishInteractionClass(InteractionClassHandle theIntera
    if (!_fdd->interactionClass(c))
       throw InteractionClassNotDefined(theInteraction.toString());
    _publishedInteractions.insert(c);
+   evaluateAdvisories();
 }
 
 // 5.5
@@ -582,6 +604,7 @@ void MqttRTIambassador::unpublishInteractionClass(InteractionClassHandle theInte
    if (!_fdd->interactionClass(c))
       throw InteractionClassNotDefined(theInteraction.toString());
    _publishedInteractions.erase(c);
+   evaluateAdvisories();
 }
 
 // 5.6
@@ -849,6 +872,7 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstance(ObjectClassHandle
       if (Fdd::Attribute const* priv = _fdd->findAttribute(theClassValue, "HLAprivilegeToDeleteObject"))
          o.owned.insert(priv->handle);
       _objects[o.handle] = o;
+      evaluateAdvisories();
    }
    Json info = Json::object();
    info.set("instance", hex64(o.handle));
@@ -856,6 +880,10 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstance(ObjectClassHandle
    info.set("name", o.name);
    info.set("owner", hex64(o.owner));
    info.set("clientId", o.ownerClient);
+   Json owned = Json::array();
+   for (std::uint64_t a : o.owned)
+      owned.push(hex64(a));
+   info.set("owned", owned);
    try
    {
       _transport->publish(o.topic + "/info", info.dump(), 1, true);
@@ -1251,7 +1279,7 @@ std::wstring MqttRTIambassador::getObjectInstanceName(ObjectInstanceHandle theHa
 
 // 5.10 to 5.17 advisory switches: stored, with the standard IsOn/IsOff
 // checks; no advisory callback is generated yet.
-#define HLA_MQTT_SWITCH(Name, index, value, AlreadyExc)                                         void MqttRTIambassador::Name()                                                               {                                                                                               checkJoined();                                                                               if (_advisorySwitches[index].exchange(value) == value)                                          throw AlreadyExc(L"" #Name);                                                           }
+#define HLA_MQTT_SWITCH(Name, index, value, AlreadyExc)    void MqttRTIambassador::Name()    {       checkJoined();       if (_advisorySwitches[index] == value)          throw AlreadyExc(L"" #Name);       setAdvisorySwitch(index, value);    }
 
 HLA_MQTT_SWITCH(enableObjectClassRelevanceAdvisorySwitch, 0, true, ObjectClassRelevanceAdvisorySwitchIsOn)
 HLA_MQTT_SWITCH(disableObjectClassRelevanceAdvisorySwitch, 0, false, ObjectClassRelevanceAdvisorySwitchIsOff)

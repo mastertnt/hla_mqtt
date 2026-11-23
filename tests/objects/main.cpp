@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -127,6 +128,9 @@ struct Federate : NullFederateAmbassador
    std::map<ObjectInstanceHandle, std::string> removed; // object -> tag
    std::vector<std::pair<ObjectInstanceHandle, AttributeHandleSet>> provides;
    std::map<std::wstring, bool> reservations;
+   // advisories: "start:<class>", "stop:<class>", "on:<object>:<n attrs>", ...
+   std::vector<std::string> advisories;
+   std::set<AttributeHandle> updatesOn, inScope;
    std::set<std::wstring> multipleSucceeded, multipleFailed;
 
    explicit Federate(std::string const& clientId)
@@ -189,6 +193,39 @@ struct Federate : NullFederateAmbassador
    {
       provides.push_back(std::make_pair(o, a));
    }
+   void startRegistrationForObjectClass(ObjectClassHandle c) RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("start:" + narrow(c.toString()));
+   }
+   void stopRegistrationForObjectClass(ObjectClassHandle c) RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("stop:" + narrow(c.toString()));
+   }
+   void turnInteractionsOn(InteractionClassHandle c) RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("ion:" + narrow(c.toString()));
+   }
+   void turnInteractionsOff(InteractionClassHandle c) RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("ioff:" + narrow(c.toString()));
+   }
+   void turnUpdatesOnForObjectInstance(ObjectInstanceHandle, AttributeHandleSet const& a)
+      RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("on");
+      updatesOn.insert(a.begin(), a.end());
+   }
+   void turnUpdatesOffForObjectInstance(ObjectInstanceHandle, AttributeHandleSet const& a)
+      RTI_THROW((FederateInternalError)) override
+   {
+      advisories.push_back("off");
+      for (AttributeHandle const& h : a)
+         updatesOn.erase(h);
+   }
+   void attributesInScope(ObjectInstanceHandle, AttributeHandleSet const& a) RTI_THROW((FederateInternalError)) override
+   {
+      inScope.insert(a.begin(), a.end());
+   }
    void objectInstanceNameReservationSucceeded(std::wstring const& n) RTI_THROW((FederateInternalError)) override
    {
       reservations[n] = true;
@@ -208,6 +245,68 @@ struct Federate : NullFederateAmbassador
       multipleFailed = n;
    }
 };
+bool has(std::vector<std::string> const& v, std::string const& x)
+{
+   for (std::string const& e : v)
+      if (e == x)
+         return true;
+   return false;
+}
+
+// Advisory callbacks between a publisher X and a subscriber Y.
+void advisoryTests(std::string const& run)
+{
+   std::wstring const fed = widen("advtest-" + run);
+   Federate x("adv-x-" + run), y("adv-y-" + run);
+   x.rti->createFederationExecution(fed, fom("base.xml"));
+   x.rti->joinFederationExecution(L"x", L"t", fed);
+   y.rti->joinFederationExecution(L"y", L"t", fed);
+   ObjectClassHandle const vehicle = x.rti->getObjectClassHandle(L"Vehicle");
+   ObjectClassHandle const car = x.rti->getObjectClassHandle(L"Vehicle.Car");
+   AttributeHandle const position = x.rti->getAttributeHandle(car, L"Position");
+   AttributeHandle const speed = x.rti->getAttributeHandle(car, L"Speed");
+   InteractionClassHandle const message = x.rti->getInteractionClassHandle(L"Message");
+   InteractionClassHandle const urgent = x.rti->getInteractionClassHandle(L"Message.Urgent");
+   std::string const carS = narrow(car.toString()), urgentS = narrow(urgent.toString());
+
+   x.rti->enableObjectClassRelevanceAdvisorySwitch();
+   x.rti->enableAttributeRelevanceAdvisorySwitch();
+   x.rti->enableInteractionRelevanceAdvisorySwitch();
+   y.rti->enableAttributeScopeAdvisorySwitch();
+   x.rti->publishObjectClassAttributes(car, AttributeHandleSet{position, speed});
+   x.rti->publishInteractionClass(urgent);
+   x.settle(0.3);
+   check(x.advisories.empty(), "advisories: nothing while nobody subscribes");
+
+   y.rti->subscribeObjectClassAttributes(vehicle, AttributeHandleSet{position}, true, L"");
+   check(x.pump([&] { return has(x.advisories, "start:" + carS); }),
+         "startRegistrationForObjectClass(Car) when another federate subscribes to its superclass");
+   ObjectInstanceHandle const obj = x.rti->registerObjectInstance(car);
+   check(x.pump([&] { return !x.updatesOn.empty(); }) && x.updatesOn == std::set<AttributeHandle>{position},
+         "turnUpdatesOn for the subscribed attribute only (Position, not Speed)");
+   check(y.pump([&] { return !y.inScope.empty(); }) && y.inScope == std::set<AttributeHandle>{position},
+         "attributesInScope at discovery");
+
+   y.rti->subscribeInteractionClass(message);
+   check(x.pump([&] { return has(x.advisories, "ion:" + urgentS); }),
+         "turnInteractionsOn(Urgent) when another federate subscribes to Message");
+
+   y.rti->unsubscribeObjectClass(vehicle);
+   check(x.pump([&] { return has(x.advisories, "stop:" + carS) && x.updatesOn.empty(); }),
+         "unsubscribe: stopRegistrationForObjectClass and turnUpdatesOff");
+   y.rti->unsubscribeInteractionClass(message);
+   check(x.pump([&] { return has(x.advisories, "ioff:" + urgentS); }), "unsubscribe: turnInteractionsOff");
+
+   // A subscriber that leaves the federation turns the updates off as well.
+   y.rti->subscribeObjectClassAttributes(car, AttributeHandleSet{position, speed}, true, L"");
+   check(x.pump([&] { return x.updatesOn.size() == 2; }), "subscription at Car: Position and Speed relevant");
+   y.rti->resignFederationExecution(NO_ACTION);
+   check(x.pump([&] { return x.updatesOn.empty(); }), "subscriber resigned: turnUpdatesOff");
+
+   x.rti->deleteObjectInstance(obj, text(""));
+   x.rti->resignFederationExecution(NO_ACTION);
+   x.rti->destroyFederationExecution(fed);
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -225,6 +324,7 @@ int main(int argc, char** argv)
 
    try
    {
+      advisoryTests(run);
       Federate a("objtest-a-" + run), b("objtest-b-" + run), c("objtest-c-" + run);
       a.rti->createFederationExecution(fed, fom("base.xml"));
       a.rti->joinFederationExecution(L"producer", L"t", fed);

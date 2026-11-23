@@ -132,7 +132,7 @@ Testé avec `f18HLA1516e_64.exe` (publie un F-18, FOM RPR) et `netdumpHLA1516e_6
 - Construire la DLL sous les noms attendus : `-DHLA_MQTT_RTI_LIBRARY_NAME=librti1516e64 -DHLA_MQTT_FEDTIME_LIBRARY_NAME=libfedtime1516e64`, puis mettre ce dossier dans le `PATH` des fédérés.
 - VR-Link vérifie la « version du compilateur du RTI » en lisant la version de l'éditeur de liens dans l'en-tête PE de la DLL (14.00 attendu). Avec une DLL liée par VS2019 (14.29) : f18 s'arrête (contournable par `--noRtiCompilerCheck`), netdump plante (exception non attrapée). Mettre ce champ à 14.00 suffit.
 - Résultat : création de la fédération avec les modules RPR, join des deux fédérés, découverte de l'F-18 par netdump et réception de ses mises à jour (45 attributs RPR décodés).
-- Il faut aujourd'hui lancer f18 avec `--ignoreAdvisories` : VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance`, callback d'avis que le RTI n'émet pas encore.
+- VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance` : fonctionne depuis les callbacks d'avis (avant : il fallait `--ignoreAdvisories`).
 - Avertissements sans conséquence : dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes, faute de MIM standard chargé.
 
 ## Paramètres de connexion
@@ -167,6 +167,7 @@ Tous les topics sont retained, sauf `sync`. `F` est le nom de la fédération, e
 | `<prefix>/federations/F/interactions/<chemin de classe>/@` (non retained) | interaction (binaire) |
 | `<prefix>/federations/F/requests/<fédéré>`, `.../classrequests/<chemin>/@` (non retained) | requêtes de mise à jour d'attributs |
 | `<prefix>/federations/F/sync/<label>/point`, `.../achieved/<fédéré>` | point de synchronisation, réalisations |
+| `<prefix>/federations/F/decl/<fédéré>` | abonnements du fédéré (pour les avis) |
 | `<prefix>/federations/F/time/<fédéré>` | état temporel : temps, lookahead, avance demandée, promesse, versions vues |
 
 Le chemin de classe a un niveau de topic par composant du nom qualifié (`HLAobjectRoot/Vehicle/Car`).
@@ -191,7 +192,7 @@ Seule une couverture minimale est abonnée (jamais une classe avec un de ses anc
 - **Resign** : `DELETE_OBJECTS` et variantes suppriment les objets ; `UNCONDITIONALLY_DIVEST_ATTRIBUTES` les laisse sans propriétaire ; `NO_ACTION` lève `FederateOwnsAttributes` s'il en reste. Un fédéré disparu (Last Will) voit ses objets retirés chez les autres.
 - **Variantes horodatées** acceptées et livrées en ordre de réception avec leur temps, puisqu'aucun fédéré ne peut encore être régulateur.
 - Les mises à jour et interactions partent sans attendre l'accusé du broker (QoS 1, ou QoS 0 si tous les attributs ou l'interaction sont `HLAbestEffort`) ; Paho conserve l'ordre.
-- Commutateurs d'avis (relevance, scope) : mémorisés avec les contrôles standard, sans callbacks d'avis.
+- **Avis** : chaque fédéré publie ses abonnements (`F/decl/<fédéré>`, retained). Chacun en déduit pour lui-même `start/stopRegistrationForObjectClass` (abonnement à la classe ou à une superclasse), `turnInteractionsOn/Off`, `turnUpdatesOn/OffForObjectInstance` (attributs possédés reçus par un abonné, à la classe sous laquelle il connaît l'objet) et `attributesInScope` à la découverte. Valeurs initiales des commutateurs : `<switches>` du FOM, désactivés sinon.
 
 ### Points de synchronisation
 
@@ -265,7 +266,7 @@ ctest --preset conan-release --output-on-failure
 ## Suite prévue
 
 - Retractions, changement d'ordre des attributs et interactions.
-- Gestion de la propriété, MOM (`HLAmanager`), DDM, callbacks d'avis, sauvegarde/restauration.
+- Gestion de la propriété, MOM (`HLAmanager`), DDM, sauvegarde/restauration.
 - Présence `offline` (Last Will) d'un client disparu : reste retained sur le broker, rien ne l'efface.
 
 ---

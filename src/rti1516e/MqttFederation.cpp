@@ -126,6 +126,11 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
          handleObjectTraffic(rest, payload);
          return;
       }
+      if (startsWith(rest, "decl/"))
+      {
+         handleDeclarations(rest.substr(5), payload);
+         return;
+      }
       if (startsWith(rest, "time/"))
       {
          handleTimeState(rest.substr(5), payload);
@@ -155,12 +160,14 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
          // A federate joined or left: synchronization sets, GALT.
          evaluateAllSync();
          evaluateTime();
+         evaluateAdvisories();
       }
    }
    if (_fdd && _transport && startsWith(topic, _transport->settings().topicPrefix + "/clients/"))
    {
       evaluateAllSync();
       evaluateTime();
+      evaluateAdvisories();
    }
 
    // Module added by another federate of our federation: the FDD only grows.
@@ -800,6 +807,7 @@ void MqttRTIambassador::resignFederationExecution(ResignAction resignAction)
    try
    {
       _transport->publish(ft + "/time/" + hex64(_federateHandle), std::string(), 1, true);
+      _transport->publish(ft + "/decl/" + hex64(_federateHandle), std::string(), 1, true);
    }
    catch (std::runtime_error const&)
    {

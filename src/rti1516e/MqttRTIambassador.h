@@ -112,6 +112,8 @@ private:
       std::uint64_t knownClass = 0;    // discovered as (0 = not discovered)
       bool locallyDeleted = false;     // rediscovered on the next update only
       std::set<std::uint64_t> owned;   // attributes owned by us (own objects)
+      std::set<std::uint64_t> ownedRemote; // attributes owned by the owner (from its info record)
+      std::set<std::uint64_t> relevant;    // attributes notified by turnUpdatesOn (own objects)
    };
 
    void subscribeJoinedTopics();
@@ -148,7 +150,25 @@ private:
    std::atomic<std::uint64_t> _uniqueCounter{0};
    std::set<std::pair<std::uint64_t, std::uint64_t>> _recent; // (sender, seq) duplicates guard
    std::deque<std::pair<std::uint64_t, std::uint64_t>> _recentOrder;
+   // 0 object class relevance, 1 attribute relevance, 2 attribute scope, 3 interaction relevance
    std::atomic<bool> _advisorySwitches[4] = {{false}, {false}, {false}, {false}};
+
+   // ------------------------------------------- advisories (MqttAdvisories.cpp)
+   struct RemoteDeclarations
+   {
+      std::map<std::uint64_t, std::set<std::uint64_t>> objects; // class -> subscribed attributes
+      std::set<std::uint64_t> interactions;
+   };
+   std::map<std::uint64_t, RemoteDeclarations> _remoteDecl; // other federates' subscriptions
+   std::set<std::uint64_t> _classRelevanceOn;
+   std::set<std::uint64_t> _interactionRelevanceOn;
+   std::string _lastDeclarations;
+   std::string declarationsPayload() const;                                         // _viewMutex held
+   void publishDeclarations();                                                       // _viewMutex held (async)
+   void handleDeclarations(std::string const& hexHandle, std::string const& payload); // _viewMutex held
+   void evaluateAdvisories();                                                        // _viewMutex held
+   void notifyScope(ObjectInstance const& o);                                        // _viewMutex held
+   void setAdvisorySwitch(int index, bool value);
 
    // ------------------------------------- jalon 4: synchronization (MqttSync.cpp)
    struct SyncPoint

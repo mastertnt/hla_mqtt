@@ -55,6 +55,7 @@ add_library(rti1516e SHARED
   src/rti1516e/MqttObjects.cpp
   src/rti1516e/MqttSync.cpp
   src/rti1516e/MqttTime.cpp
+  src/rti1516e/MqttAdvisories.cpp
   src/rti1516e/Trace.cpp
   src/rti1516e/Fdd.cpp
   src/rti1516e/Xml.cpp
