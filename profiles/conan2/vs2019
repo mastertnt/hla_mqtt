@@ -1,0 +1,14 @@
+[settings]
+os=Windows
+arch=x86_64
+compiler=msvc
+compiler.version=192
+compiler.cppstd=17
+compiler.runtime=dynamic
+build_type=Release
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Visual Studio 16 2019
+
+[buildenv]
+CMAKE_POLICY_VERSION_MINIMUM=3.5

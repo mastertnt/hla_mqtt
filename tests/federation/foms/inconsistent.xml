@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Redefines Vehicle.Position with another order type: InconsistentFDD with base.xml -->
+<objectModel xmlns="http://standards.ieee.org/IEEE1516-2010">
+  <objects>
+    <objectClass>
+      <name>HLAobjectRoot</name>
+      <objectClass>
+        <name>Vehicle</name>
+        <attribute>
+          <name>Position</name>
+          <transportation>HLAreliable</transportation>
+          <order>Receive</order>
+        </attribute>
+      </objectClass>
+    </objectClass>
+  </objects>
+</objectModel>

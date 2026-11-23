@@ -1,0 +1,16 @@
+# Conan 1.66 - Visual Studio 2019 (v142), x64, Release
+[settings]
+os=Windows
+arch=x86_64
+compiler=Visual Studio
+compiler.version=16
+compiler.runtime=MD
+compiler.cppstd=17
+build_type=Release
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Visual Studio 16 2019
+
+# CMake 4.x refuses cmake_minimum_required < 3.5 (paho-mqtt-c 1.3.13)
+[env]
+CMAKE_POLICY_VERSION_MINIMUM=3.5

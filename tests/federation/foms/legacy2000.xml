@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- IEEE 1516-2000 style: properties as XML attributes -->
+<objectModel name="Legacy" type="FOM" version="1.0">
+  <objects>
+    <objectClass name="HLAobjectRoot" sharing="Neither">
+      <attribute name="HLAprivilegeToDeleteObject" dataType="HLAtoken" transportation="HLAreliable" order="TimeStamp"/>
+      <objectClass name="Ship" sharing="PublishSubscribe">
+        <attribute name="Heading" dataType="HLAfloat32BE" transportation="HLAbestEffort" order="Receive"/>
+      </objectClass>
+    </objectClass>
+  </objects>
+  <interactions>
+    <interactionClass name="HLAinteractionRoot" sharing="Neither" transportation="HLAreliable" order="Receive">
+      <interactionClass name="Ping" sharing="PublishSubscribe" transportation="HLAreliable" order="Receive">
+        <parameter name="Seq" dataType="HLAinteger32BE"/>
+      </interactionClass>
+    </interactionClass>
+  </interactions>
+</objectModel>
