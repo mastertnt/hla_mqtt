@@ -5,8 +5,9 @@
 //
 //   hla-ddm-test [--broker mqtt://host:1883]
 //
-// Filtering by region overlap is not implemented yet: a subscription with
-// regions behaves here like a default-region subscription.
+// Part 1: services and their exceptions. Part 2 (filterTests): filtering by
+// region overlap, scope and relevance advisories, sends and requests with
+// regions.
 //
 // Standard API only. Exit code 0 = all checks passed.
 
@@ -24,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -105,6 +107,17 @@ struct Federate : NullFederateAmbassador
    std::map<ObjectInstanceHandle, ObjectClassHandle> discovered;
    int reflections = 0;
    int interactions = 0;
+   std::vector<std::string> tags; // tags of reflections and interactions
+   int provides = 0;
+   std::set<AttributeHandle> inScope, updatesOn;
+   int outOfScope = 0;
+   bool got(std::string const& tag) const
+   {
+      for (std::string const& t : tags)
+         if (t == tag)
+            return true;
+      return false;
+   }
 
    explicit Federate(std::string const& clientId)
    {
@@ -130,17 +143,49 @@ struct Federate : NullFederateAmbassador
    {
       discovered[o] = c;
    }
-   void reflectAttributeValues(ObjectInstanceHandle, AttributeHandleValueMap const&, VariableLengthData const&,
+   static std::string str(VariableLengthData const& d)
+   {
+      return d.data() ? std::string(static_cast<char const*>(d.data()), d.size()) : std::string();
+   }
+   void reflectAttributeValues(ObjectInstanceHandle, AttributeHandleValueMap const&, VariableLengthData const& tag,
                                OrderType, TransportationType, SupplementalReflectInfo)
       RTI_THROW((FederateInternalError)) override
    {
       ++reflections;
+      tags.push_back(str(tag));
    }
-   void receiveInteraction(InteractionClassHandle, ParameterHandleValueMap const&, VariableLengthData const&,
+   void receiveInteraction(InteractionClassHandle, ParameterHandleValueMap const&, VariableLengthData const& tag,
                            OrderType, TransportationType, SupplementalReceiveInfo)
       RTI_THROW((FederateInternalError)) override
    {
       ++interactions;
+      tags.push_back(str(tag));
+   }
+   void provideAttributeValueUpdate(ObjectInstanceHandle, AttributeHandleSet const&, VariableLengthData const&)
+      RTI_THROW((FederateInternalError)) override
+   {
+      ++provides;
+   }
+   void attributesInScope(ObjectInstanceHandle, AttributeHandleSet const& a) RTI_THROW((FederateInternalError)) override
+   {
+      inScope.insert(a.begin(), a.end());
+   }
+   void attributesOutOfScope(ObjectInstanceHandle, AttributeHandleSet const& a) RTI_THROW((FederateInternalError)) override
+   {
+      ++outOfScope;
+      for (AttributeHandle const& h : a)
+         inScope.erase(h);
+   }
+   void turnUpdatesOnForObjectInstance(ObjectInstanceHandle, AttributeHandleSet const& a)
+      RTI_THROW((FederateInternalError)) override
+   {
+      updatesOn.insert(a.begin(), a.end());
+   }
+   void turnUpdatesOffForObjectInstance(ObjectInstanceHandle, AttributeHandleSet const& a)
+      RTI_THROW((FederateInternalError)) override
+   {
+      for (AttributeHandle const& h : a)
+         updatesOn.erase(h);
    }
 };
 
@@ -148,6 +193,113 @@ AttributeHandleSetRegionHandleSetPairVector pairs(AttributeHandle a, RegionHandl
 {
    return AttributeHandleSetRegionHandleSetPairVector{
       std::make_pair(AttributeHandleSet{a}, RegionHandleSet{r})};
+}
+
+// One-dimension region [lower, upper) on Zone, committed.
+RegionHandle zoneRegion(Federate& f, DimensionHandle zone, unsigned long lower, unsigned long upper)
+{
+   RegionHandle const r = f.rti->createRegion(DimensionHandleSet{zone});
+   f.rti->setRangeBounds(r, zone, RangeBounds(lower, upper));
+   f.rti->commitRegionModifications(RegionHandleSet{r});
+   return r;
+}
+
+void move(Federate& f, RegionHandle r, DimensionHandle zone, unsigned long lower, unsigned long upper)
+{
+   f.rti->setRangeBounds(r, zone, RangeBounds(lower, upper));
+   f.rti->commitRegionModifications(RegionHandleSet{r});
+}
+
+// Filtering by overlap, advisories, sends and requests with regions.
+void filterTests(std::string const& run)
+{
+   std::wstring const fed = widen("ddmfilter-" + run);
+   Federate a("ddmfilter-a-" + run), b("ddmfilter-b-" + run);
+   a.rti->createFederationExecution(fed, widen(std::string(HLA_TEST_FOM_DIR) + "/base.xml"));
+   a.rti->joinFederationExecution(L"a", L"t", fed);
+   b.rti->joinFederationExecution(L"b", L"t", fed);
+   ObjectClassHandle const vehicle = a.rti->getObjectClassHandle(L"Vehicle");
+   AttributeHandle const position = a.rti->getAttributeHandle(vehicle, L"Position");
+   AttributeHandle const name = a.rti->getAttributeHandle(vehicle, L"Name");
+   InteractionClassHandle const message = a.rti->getInteractionClassHandle(L"Message");
+   InteractionClassHandle const urgent = a.rti->getInteractionClassHandle(L"Message.Urgent");
+   DimensionHandle const zone = a.rti->getDimensionHandle(L"Zone");
+   ParameterHandleValueMap const none;
+
+   a.rti->enableAttributeRelevanceAdvisorySwitch();
+   b.rti->enableAttributeScopeAdvisorySwitch();
+   a.rti->publishObjectClassAttributes(vehicle, AttributeHandleSet{position, name});
+   a.rti->publishInteractionClass(message);
+   a.rti->publishInteractionClass(urgent);
+
+   RegionHandle const ua = zoneRegion(a, zone, 10, 20);
+   ObjectInstanceHandle const object = a.rti->registerObjectInstanceWithRegions(vehicle, pairs(name, ua));
+   RegionHandle const sb = zoneRegion(b, zone, 30, 40);
+   b.rti->subscribeObjectClassAttributesWithRegions(vehicle, pairs(name, sb));
+   check(b.pump([&] { return b.discovered.count(object) != 0; }), "filter: discovery is not filtered by regions");
+   a.settle(0.3);
+   check(!a.updatesOn.count(name), "no turnUpdatesOn while the regions do not overlap ([10,20) / [30,40))");
+   check(b.inScope.empty(), "no attributesInScope while the regions do not overlap");
+   auto send = [&](std::string const& tag) {
+      AttributeHandleValueMap values;
+      values[name] = text(tag);
+      a.rti->updateAttributeValues(object, values, text(tag));
+   };
+   send("n1");
+   b.settle();
+   check(!b.got("n1"), "update outside the subscription region is not reflected");
+
+   move(a, ua, zone, 35, 36);
+   check(b.pump([&] { return b.inScope.count(name) != 0; }),
+         "attributesInScope when the update region moves into the subscription region");
+   check(a.pump([&] { return a.updatesOn.count(name) != 0; }), "turnUpdatesOn once the regions overlap");
+   send("n2");
+   check(b.pump([&] { return b.got("n2"); }), "update inside the subscription region is reflected");
+
+   move(b, sb, zone, 0, 5);
+   check(b.pump([&] { return b.outOfScope > 0 && !b.inScope.count(name); }),
+         "attributesOutOfScope when the subscription region moves away");
+   check(a.pump([&] { return !a.updatesOn.count(name); }), "turnUpdatesOff when the subscriber's region moves away");
+   send("n3");
+   b.settle();
+   check(!b.got("n3"), "no reflection after the subscription region moved away");
+
+   b.rti->subscribeObjectClassAttributes(vehicle, AttributeHandleSet{name});
+   send("n4");
+   check(b.pump([&] { return b.got("n4"); }), "a default-region subscription receives whatever the regions");
+   b.rti->unsubscribeObjectClass(vehicle);
+
+   // ---------------------------------- 9.13 requestAttributeValueUpdateWithRegions
+   RegionHandle const rq = zoneRegion(b, zone, 30, 40);
+   b.rti->requestAttributeValueUpdateWithRegions(vehicle, pairs(name, rq), text("rq1"));
+   check(a.pump([&] { return a.provides == 1; }), "request with an overlapping region -> provideAttributeValueUpdate");
+   move(b, rq, zone, 0, 5);
+   b.rti->requestAttributeValueUpdateWithRegions(vehicle, pairs(name, rq), text("rq2"));
+   a.settle();
+   check(a.provides == 1, "request with a region that misses the update region -> nothing to provide");
+   expect<InvalidRegionContext>("requestAttributeValueUpdateWithRegions on Position -> InvalidRegionContext",
+                                [&] { b.rti->requestAttributeValueUpdateWithRegions(vehicle, pairs(position, rq), text("")); });
+
+   // ------------------------------------------- 9.12 sendInteractionWithRegions
+   b.rti->subscribeInteractionClassWithRegions(message, RegionHandleSet{sb}); // [0, 5)
+   RegionHandle const si1 = zoneRegion(a, zone, 2, 3);
+   RegionHandle const si2 = zoneRegion(a, zone, 50, 60);
+   a.rti->sendInteractionWithRegions(message, none, RegionHandleSet{si1}, text("i1"));
+   check(b.pump([&] { return b.got("i1"); }), "interaction sent with an overlapping region is received");
+   a.rti->sendInteractionWithRegions(message, none, RegionHandleSet{si2}, text("i2"));
+   a.rti->sendInteraction(message, none, text("i3"));
+   check(b.pump([&] { return b.got("i3"); }) && !b.got("i2"),
+         "interaction sent with a distant region is filtered, one sent without region is received");
+   expect<InvalidRegionContext>("sendInteractionWithRegions on a class without dimension -> InvalidRegionContext",
+                                [&] { a.rti->sendInteractionWithRegions(urgent, none, RegionHandleSet{si1}, text("")); });
+   expect<RegionNotCreatedByThisFederate>("sendInteractionWithRegions with B's region -> RegionNotCreatedByThisFederate",
+                                          [&] { a.rti->sendInteractionWithRegions(message, none, RegionHandleSet{sb}, text("")); });
+   expect<InteractionClassNotPublished>("sendInteractionWithRegions, not published -> InteractionClassNotPublished",
+                                        [&] { b.rti->sendInteractionWithRegions(message, none, RegionHandleSet{rq}, text("")); });
+
+   a.rti->resignFederationExecution(DELETE_OBJECTS);
+   b.rti->resignFederationExecution(NO_ACTION);
+   a.rti->destroyFederationExecution(fed);
 }
 } // namespace
 
@@ -326,6 +478,7 @@ int main(int argc, char** argv)
       a.rti->resignFederationExecution(DELETE_OBJECTS);
       b.rti->resignFederationExecution(NO_ACTION);
       a.rti->destroyFederationExecution(fed);
+      filterTests(run);
    }
    catch (Exception const& e)
    {

@@ -16,8 +16,15 @@
 //
 // A subscription with regions makes the attribute (or interaction class)
 // subscribed, like a default-region subscription; the subscription stays as
-// long as one of the two remains. Filtering the traffic by region overlap is
-// not done yet: a subscriber with regions receives every update.
+// long as one of the two remains.
+//
+// Filtering (receiver side, see Extents.h for overlap): an attribute value or
+// an interaction is delivered when the receiver subscribes with the default
+// region, or when one of its subscription regions overlaps one of the update
+// regions (default region if none). Interactions sent with regions carry their
+// extents in the message (9.12). Subscriptions with regions only are published
+// in F/decl/<federate> ("or") so that owners compute attribute relevance.
+// Discovery is not filtered: subscribing to the class is enough.
 
 #include "MqttRTIambassador.h"
 
@@ -147,27 +154,62 @@ std::string MqttRTIambassador::objectInfo(ObjectInstance const& o) const
    for (auto const& attr : o.updateRegions)
    {
       Json list = Json::array();
-      for (std::uint64_t r : attr.second)
-      {
-         auto it = _regions.find(r);
-         if (it == _regions.end())
-            continue;
-         Json extents = Json::object();
-         for (auto const& d : it->second.committed)
-         {
-            Json range = Json::array();
-            range.push(Json(double(d.second.first)));
-            range.push(Json(double(d.second.second)));
-            extents.set(hex64(d.first), range);
-         }
-         list.push(extents);
-      }
+      for (Extents const& e : ownExtents(attr.second))
+         list.push(extentsToJson(e));
       if (!list.items().empty())
          regions.set(hex64(attr.first), list);
    }
    if (!regions.members().empty())
       info.set("regions", regions);
    return info.dump();
+}
+
+std::vector<Extents> MqttRTIambassador::ownExtents(std::set<std::uint64_t> const& regions) const
+{
+   std::vector<Extents> out;
+   for (std::uint64_t r : regions)
+   {
+      auto it = _regions.find(r);
+      if (it != _regions.end())
+         out.push_back(it->second.committed);
+   }
+   return out;
+}
+
+std::vector<Extents> MqttRTIambassador::updateExtents(ObjectInstance const& o, std::uint64_t attribute) const
+{
+   if (o.owner == _federateHandle)
+   {
+      auto it = o.updateRegions.find(attribute);
+      return it == o.updateRegions.end() ? std::vector<Extents>() : ownExtents(it->second);
+   }
+   auto it = o.remoteRegions.find(attribute);
+   return it == o.remoteRegions.end() ? std::vector<Extents>() : it->second;
+}
+
+bool MqttRTIambassador::subscriptionCovers(std::uint64_t cls, std::uint64_t attribute,
+                                           std::vector<Extents> const& sent) const
+{
+   auto plain = _plainSubscribedAttributes.find(cls);
+   if (plain != _plainSubscribedAttributes.end() && plain->second.count(attribute))
+      return true;
+   auto c = _regionSubscribedAttributes.find(cls);
+   if (c == _regionSubscribedAttributes.end())
+      return false;
+   auto a = c->second.find(attribute);
+   if (a == c->second.end() || a->second.empty())
+      return false;
+   return anyOverlap(sent, ownExtents(a->second));
+}
+
+bool MqttRTIambassador::interactionCovers(std::uint64_t cls, std::vector<Extents> const& sent) const
+{
+   if (_plainSubscribedInteractions.count(cls))
+      return true;
+   auto it = _regionSubscribedInteractions.find(cls);
+   if (it == _regionSubscribedInteractions.end() || it->second.empty())
+      return false;
+   return anyOverlap(sent, ownExtents(it->second));
 }
 
 std::vector<std::pair<std::string, std::string>> MqttRTIambassador::infoRecordsUsing(
@@ -235,6 +277,8 @@ void MqttRTIambassador::commitRegionModifications(RegionHandleSet const& theRegi
       for (std::uint64_t r : changed)
          _regions[r].committed = _regions[r].pending;
       records = infoRecordsUsing(changed);
+      publishDeclarations(); // subscription regions
+      evaluateAdvisories();  // relevance of our updates, scope of what we receive
    }
    publishInfoRecords(records);
 }
@@ -302,6 +346,7 @@ void MqttRTIambassador::associateRegionsForUpdates(
          });
       if (o.owner == _federateHandle)
          records.emplace_back(o.topic + "/info", objectInfo(o));
+      evaluateAdvisories();
    }
    publishInfoRecords(records);
 }
@@ -332,6 +377,7 @@ void MqttRTIambassador::unassociateRegionsForUpdates(
          });
       if (o.owner == _federateHandle)
          records.emplace_back(o.topic + "/info", objectInfo(o));
+      evaluateAdvisories();
    }
    publishInfoRecords(records);
 }
@@ -442,6 +488,40 @@ void MqttRTIambassador::unsubscribeInteractionClassWithRegions(InteractionClassH
       recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
+}
+
+// ================================================================ 9.12, 9.13
+void MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction,
+                                                   ParameterHandleValueMap const& theParameterValues,
+                                                   RegionHandleSet const& theRegionHandleSet,
+                                                   VariableLengthData const& theUserSuppliedTag)
+{
+   std::lock_guard<std::mutex> lock(_stateMutex);
+   checkJoined();
+   sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, nullptr, &theRegionHandleSet);
+}
+
+MessageRetractionHandle MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction,
+                                                                      ParameterHandleValueMap const& theParameterValues,
+                                                                      RegionHandleSet const& theRegionHandleSet,
+                                                                      VariableLengthData const& theUserSuppliedTag,
+                                                                      LogicalTime const& theTime)
+{
+   std::lock_guard<std::mutex> lock(_stateMutex);
+   checkJoined();
+   return sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, &theTime, &theRegionHandleSet);
+}
+
+void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle theClass,
+                                                               AttributeHandleSetRegionHandleSetPairVector const& theSet,
+                                                               VariableLengthData const& theUserSuppliedTag)
+{
+   std::lock_guard<std::mutex> lock(_stateMutex);
+   checkJoined();
+   AttributeHandleSet all;
+   for (auto const& pair : theSet)
+      all.insert(pair.first.begin(), pair.first.end());
+   requestClassUpdate(theClass, all, &theSet, theUserSuppliedTag);
 }
 
 // ================================================================ 10.28 to 10.30

@@ -120,19 +120,4 @@ bool MqttRTIambassador::isAttributeOwnedByFederate(ObjectInstanceHandle theObjec
    notImplemented(L"isAttributeOwnedByFederate");
 }
 
-void MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction, ParameterHandleValueMap const & theParameterValues, RegionHandleSet const & theRegionHandleSet, VariableLengthData const & theUserSuppliedTag)
-{
-   notImplemented(L"sendInteractionWithRegions");
-}
-
-MessageRetractionHandle MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction, ParameterHandleValueMap const & theParameterValues, RegionHandleSet const & theRegionHandleSet, VariableLengthData const & theUserSuppliedTag, LogicalTime const & theTime)
-{
-   notImplemented(L"sendInteractionWithRegions");
-}
-
-void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theSet, VariableLengthData const & theUserSuppliedTag)
-{
-   notImplemented(L"requestAttributeValueUpdateWithRegions");
-}
-
 }

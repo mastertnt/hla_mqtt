@@ -58,6 +58,7 @@ add_library(rti1516e SHARED
   src/rti1516e/MqttAdvisories.cpp
   src/rti1516e/MqttRegions.cpp
   src/rti1516e/MqttObjectOptions.cpp
+  src/rti1516e/MqttMom.cpp
   src/rti1516e/Trace.cpp
   src/rti1516e/Fdd.cpp
   src/rti1516e/Xml.cpp
@@ -67,7 +68,17 @@ add_library(rti1516e SHARED
   src/rti1516e/time/StandardLogicalTimes.cpp
   src/rti1516e/generated/Exceptions.cpp
   src/rti1516e/generated/RTIambassadorStubs.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/embedded/StandardMim.cpp
 )
+# Standard MIM (IEEE 1516.1-2010), built into the library: merged implicitly
+# when a federation is created without a MIM.
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/embedded/StandardMim.cpp
+  COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/mim/HLAstandardMIM.xml
+          -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/embedded/StandardMim.cpp -DSYMBOL=standardMim
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mim/HLAstandardMIM.xml ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake
+  COMMENT "Embedding the standard MIM")
 target_include_directories(rti1516e
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/rti1516e)
@@ -179,6 +190,17 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
     set_property(TARGET hla-ddm-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   endif()
   add_test(NAME ddm COMMAND hla-ddm-test)
+
+  # Management Object Model: needs a broker.
+  add_executable(hla-mom-test tests/mom/main.cpp)
+  target_link_libraries(hla-mom-test PRIVATE rti1516e)
+  target_compile_definitions(hla-mom-test PRIVATE
+    HLA_TEST_FOM_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/federation/foms")
+  if(MSVC)
+    target_compile_options(hla-mom-test PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-mom-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME mom COMMAND hla-mom-test)
 endif()
 
 # ---------------------------------------------------------------- install
@@ -189,5 +211,5 @@ install(TARGETS rti1516e fedtime1516e
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/RTI DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(HLA_MQTT_RTI_BUILD_TESTS)
-  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

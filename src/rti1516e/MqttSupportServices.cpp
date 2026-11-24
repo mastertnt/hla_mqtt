@@ -305,7 +305,8 @@ unsigned long MqttRTIambassador::normalizeFederateHandle(FederateHandle theFeder
    if (!theFederateHandle.isValid())
       throw InvalidFederateHandle(L"invalid federate handle");
    std::uint64_t const h = FederateHandleFriend::value(theFederateHandle);
-   return static_cast<unsigned long>(h ^ (h >> 32));
+   // Below the upper bound of HLAfederate (0xFFFFFFFF, see Fdd.cpp).
+   return static_cast<unsigned long>((h ^ (h >> 32)) & 0xFFFFFFFFull) % 0xFFFFFFFFul;
 }
 
 unsigned long MqttRTIambassador::normalizeServiceGroup(ServiceGroup theServiceGroup)

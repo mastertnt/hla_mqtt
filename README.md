@@ -43,6 +43,8 @@ tests/federation/       hla-federation-test : plusieurs ambassadors, modules FOM
 tests/objects/          hla-objects-test : publish/subscribe, objets, interactions entre fédérés
 tests/time/             hla-time-test : points de synchronisation, gestion du temps
 tests/ddm/              hla-ddm-test : régions, associations, abonnements avec régions
+tests/mom/              hla-mom-test : MOM (objets HLAmanager, requêtes, rapports, services)
+mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
   gen_rti_sources.py    régénère generated/ à partir des headers
   check_imports.py      compare les imports d'un fédéré aux exports de la DLL (Windows)
@@ -134,7 +136,7 @@ Testé avec `f18HLA1516e_64.exe` (publie un F-18, FOM RPR) et `netdumpHLA1516e_6
 - VR-Link vérifie la « version du compilateur du RTI » en lisant la version de l'éditeur de liens dans l'en-tête PE de la DLL (14.00 attendu). Avec une DLL liée par VS2019 (14.29) : f18 s'arrête (contournable par `--noRtiCompilerCheck`), netdump plante (exception non attrapée). Mettre ce champ à 14.00 suffit.
 - Résultat : création de la fédération avec les modules RPR, join des deux fédérés, découverte de l'F-18 par netdump et réception de ses mises à jour (45 attributs RPR décodés).
 - VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance` : fonctionne depuis les callbacks d'avis (avant : il fallait `--ignoreAdvisories`).
-- Avertissements sans conséquence : dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes, faute de MIM standard chargé.
+- Avertissements de l'essai sur les dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes : le MIM standard est désormais chargé (non revérifié avec VR-Link).
 
 ## Paramètres de connexion
 
@@ -194,7 +196,8 @@ Seule une couverture minimale est abonnée (jamais une classe avec un de ses anc
 - **Variantes horodatées** acceptées et livrées en ordre de réception avec leur temps, puisqu'aucun fédéré ne peut encore être régulateur.
 - Les mises à jour et interactions partent sans attendre l'accusé du broker (QoS 1, ou QoS 0 si tous les attributs ou l'interaction sont `HLAbestEffort`) ; Paho conserve l'ordre.
 - **Avis** : chaque fédéré publie ses abonnements (`F/decl/<fédéré>`, retained). Chacun en déduit pour lui-même `start/stopRegistrationForObjectClass` (abonnement à la classe ou à une superclasse), `turnInteractionsOn/Off`, `turnUpdatesOn/OffForObjectInstance` (attributs possédés reçus par un abonné, à la classe sous laquelle il connaît l'objet) et `attributesInScope` à la découverte. Valeurs initiales des commutateurs : `<switches>` du FOM, désactivés sinon.
-- **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un objet voyagent dans son enregistrement `info`, en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction comme un abonnement sans région ; les deux coexistent. **Le filtrage par recouvrement n'est pas encore fait** : un abonné avec régions reçoit tout.
+- **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un objet voyagent dans son enregistrement `info`, en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction ; il coexiste avec l'abonnement sans région (région par défaut, qui recouvre tout).
+- **Filtrage DDM (côté récepteur)** : deux régions se recouvrent si leurs intervalles se chevauchent sur chaque dimension commune ; pas de région de mise à jour = région par défaut. Une valeur d'attribut est réfléchie si l'abonné est abonné sans région, ou si une de ses régions recouvre une région de mise à jour de l'attribut. Une interaction envoyée avec `sendInteractionWithRegions` porte les étendues de ses régions dans le message. `requestAttributeValueUpdateWithRegions` ne fait fournir que les attributs dont les régions de mise à jour recouvrent celles de la requête. Les abonnements avec régions seules sont publiés dans `F/decl/<fédéré>` (`"or"`) : le propriétaire en tient compte pour `turnUpdatesOn/Off`. L'abonné reçoit `attributesInScope` / `attributesOutOfScope` quand régions, abonnements ou propriété changent. La découverte n'est pas filtrée : s'abonner à la classe suffit. `conveyRegionDesignatorSets` (régions dans les informations supplémentaires) n'est pas géré.
 - **Ordre et transport choisis par l'émetteur** : `changeAttributeOrderType` / `changeInteractionOrderType` et `request*TransportationTypeChange` ne valent que pour les messages du fédéré qui les demande (confirmation par callback, immédiate). Les autres l'apprennent par les enregistrements retained : `"transport"` dans l'enregistrement `info` de l'objet, `"it"` dans `F/decl/<fédéré>` pour les interactions ; les réflexions et interactions reçues portent ce transport, et `query*TransportationType` le rapporte. `getUpdateRateValueForAttribute` rend le taux du désignateur utilisé à l'abonnement (0 sans désignateur).
 
 ### Points de synchronisation
@@ -211,6 +214,15 @@ Le label est réservé comme un nom de fédération (réservation + barrière). 
 - Pendant une avance, un régulateur ne peut envoyer en TSO qu'au-delà de son prochain temps + lookahead (plus strict que la norme, nécessaire à la règle de coupe).
 - **Retract** : l'émetteur garde ses messages TSO dont l'horodatage dépasse encore son temps logique ; `retract` publie un message `Retract` sur le topic de l'original (même émetteur, même topic : le broker le livre après). Le récepteur retire le message de sa file TSO, ou appelle `requestRetraction` s'il l'a déjà livré TSO. Seuls les messages envoyés TSO sont rétractables (ni la partie RO d'une mise à jour, ni les suppressions).
 
+### MOM (Management Object Model)
+
+- **MIM standard** : `mim/HLAstandardMIM.xml` (IEEE 1516.1-2010) est intégré à la DLL et fusionné en premier à la création d'une fédération sans MIM ; `createFederationExecutionWithMIM` le remplace. La dimension `HLAfederate` (sans borne dans le MIM) va jusqu'à 2^32-1, borne respectée par `normalizeFederateHandle`.
+- **HLAmanager.HLAfederate** : chaque fédéré joint enregistre son instance (propriétaire : le fédéré, valeurs calculées par le RTI). Elle est mise à jour sur `requestAttributeValueUpdate` et à chaque période `HLAsetTiming`, et supprimée au resign. Le fédéré ne peut pas la mettre à jour lui-même. Les compteurs (mises à jour, réflexions, interactions, instances) et l'état du temps viennent de l'ambassador.
+- **HLAmanager.HLAfederation** : construite localement par chaque fédéré à partir des enregistrements retenus (exécution, modules FOM, fédérés) ; découverte dès que la classe est souscrite, réfléchie sur requête. `HLAcurrentFDD` contient les modules fusionnés (MIM en tête).
+- **Interactions HLArequest, HLAadjust, HLAservice** : chaque fédéré reçoit ces interactions (abonnements internes) et traite celles dont `HLAfederate` est son handle ; le fédéré n'a pas à publier les rapports. Les services `HLAservice` s'exécutent sur le thread du fédéré, au prochain `evokeCallback` (ou par le dispatcher en `HLA_IMMEDIATE`) ; un échec produit `HLAreportMOMexception`. Les requêtes de niveau fédération (points de synchronisation, modules FOM, MIM) sont traitées par le fédéré vivant de plus petit handle, qui envoie aussi `HLAreportFederateLost` quand un fédéré disparaît sans resign.
+- `HLAsetSwitches` : `conveyProducingFederate` renseigne le fédéré producteur dans les informations supplémentaires de `reflectAttributeValues` et `receiveInteraction` ; `conveyRegionDesignatorSets` est seulement mémorisé. `HLAsetExceptionReporting` signale les exceptions levées par les callbacks du fédéré.
+- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré) ; `HLAmodifyAttributeState` et les services de propriété et de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
+
 ## Client de test
 
 `hla-test-federate` n'utilise que `RTI/RTI1516.h`. Le même exécutable peut donc tourner contre une autre DLL 1516e.
@@ -226,7 +238,8 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 
 `ctest` lance `--selftest`, `hla-encoding-test` (sans broker) et `hla-federation-test`, qui suppose un broker joignable (`--broker mqtt://hôte:1883` ou `HLA_MQTT_BROKER`). Ce dernier vérifie les erreurs de création et de join, les handles identiques entre fédérés, les modules additionnels, destroy avec un fédéré disparu, et des courses (4 créations ou 4 joins simultanés sous le même nom : un seul gagnant).
 `hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente, `retract` (avant et après livraison, trop tard) et changement d'ordre des attributs et interactions.
-`hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région.
+`hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région, puis le filtrage par recouvrement (déplacement des régions de mise à jour et d'abonnement), les avis de portée et de pertinence, `sendInteractionWithRegions` et `requestAttributeValueUpdateWithRegions`.
+`hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
 Résultat attendu :
@@ -269,8 +282,7 @@ ctest --preset conan-release --output-on-failure
 
 ## Suite prévue
 
-- Gestion de la propriété, MOM (`HLAmanager`), sauvegarde/restauration.
-- DDM : `sendInteractionWithRegions`, `requestAttributeValueUpdateWithRegions`, filtrage par recouvrement de régions et avis de portée (issues #25 et #26).
+- Gestion de la propriété, sauvegarde/restauration (et leurs parties MOM).
 - Présence `offline` (Last Will) d'un client disparu : reste retained sur le broker, rien ne l'efface.
 
 ---

@@ -37,6 +37,12 @@
 
 namespace hla_mqtt
 {
+namespace embedded
+{
+extern unsigned char const standardMim[]; // mim/HLAstandardMIM.xml, see cmake/EmbedFile.cmake
+extern unsigned long long const standardMimSize;
+} // namespace embedded
+
 namespace
 {
 int const kMaxAttempts = 8;
@@ -78,6 +84,17 @@ struct Module
    std::string content;
    std::string hash;
 };
+
+// IEEE 1516.1-2010 standard MIM, built into the library.
+// "Reprinted with permission from IEEE 1516.1(TM)-2010".
+Module standardMimModule()
+{
+   Module m;
+   m.label = "HLAstandardMIM";
+   m.content.assign(reinterpret_cast<char const*>(embedded::standardMim), size_t(embedded::standardMimSize));
+   m.hash = hex64(fnv1a64(m.content));
+   return m;
+}
 
 Module loadModule(std::wstring const& designator)
 {
@@ -279,6 +296,8 @@ void MqttRTIambassador::createFederation(std::wstring const& federationName,
                                                                         : logicalTimeImplementationName;
 
    std::vector<Module> modules;
+   std::vector<std::string> designators; // of the FOM modules (MOM HLAFOMmoduleDesignatorList)
+   std::wstring mimDesignator = L"HLAstandardMIM";
    Fdd fdd;
    if (mimModule)
    {
@@ -293,6 +312,21 @@ void MqttRTIambassador::createFederation(std::wstring const& federationName,
       {
          throw CouldNotOpenMIM(fromUtf8(e.what()));
       }
+      try
+      {
+         fdd.merge(m.content, m.label);
+      }
+      catch (FddError const& e)
+      {
+         throwFddError(e, true);
+      }
+      modules.push_back(m);
+      mimDesignator = *mimModule;
+   }
+   else
+   {
+      // No MIM given: the standard MIM, published like any other module.
+      Module const m = standardMimModule();
       try
       {
          fdd.merge(m.content, m.label);
@@ -325,6 +359,7 @@ void MqttRTIambassador::createFederation(std::wstring const& federationName,
          throwFddError(e, false);
       }
       modules.push_back(m);
+      designators.push_back(m.label);
    }
 
    std::string const ft = federationTopic(federationName);
@@ -397,6 +432,12 @@ void MqttRTIambassador::createFederation(std::wstring const& federationName,
          record.set("name", toUtf8(federationName));
          record.set("timeImplementation", toUtf8(timeName));
          record.set("modules", hashes);
+         record.set("mim", modules.front().hash); // the MIM is merged first
+         record.set("mimDesignator", toUtf8(mimDesignator));
+         Json names = Json::array();
+         for (std::string const& d : designators)
+            names.push(d);
+         record.set("designators", names);
          record.set("createdBy", myId);
          record.set("rti", toUtf8(HLA_MQTT_RTI_NAME));
          record.set("version", toUtf8(HLA_MQTT_RTI_VERSION));
@@ -664,6 +705,15 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
       record.set("type", toUtf8(federateType));
       record.set("handle", hex64(handle));
       record.set("clientId", myId);
+      Json joinModules = Json::array(); // MOM: modules supplied at join
+      for (Module const& m : extra)
+      {
+         Json jm = Json::object();
+         jm.set("designator", m.label);
+         jm.set("hash", m.hash);
+         joinModules.push(jm);
+      }
+      record.set("modules", joinModules);
 
       for (int attempt = 0;; ++attempt)
       {
@@ -755,6 +805,10 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
          forgetUnder(ft + "/names/");
          forgetUnder(ft + "/claims/");
       }
+      std::vector<std::string> contents;
+      for (Module const& m : extra)
+         contents.push_back(m.content);
+      momJoined(additionalFomModules, contents);
    }
    catch (FddError const& e) // modules already in the federation
    {
@@ -798,6 +852,7 @@ void MqttRTIambassador::resignFederationExecution(ResignAction resignAction)
    try
    {
       resignObjects(resignAction); // FederateOwnsAttributes before any change
+      momResigning();               // HLAfederate object deleted
       _transport->publish(ft + "/federates/" + hex64(_federateHandle), std::string(), 1, true);
    }
    catch (std::runtime_error const& e)

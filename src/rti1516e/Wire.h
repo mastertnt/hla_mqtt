@@ -122,6 +122,7 @@ public:
       _i = 2;
    }
    WireKind kind() const { return _kind; }
+   bool atEnd() const { return _i >= _d.size(); } // optional trailing fields
    unsigned u8()
    {
       need(1);

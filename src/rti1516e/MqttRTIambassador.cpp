@@ -37,6 +37,7 @@ MqttRTIambassador::MqttRTIambassador() = default;
 
 MqttRTIambassador::~MqttRTIambassador()
 {
+   momStopThread();
    stopDispatcher();
    std::lock_guard<std::mutex> lock(_stateMutex);
    _transport.reset(); // clean MQTT disconnect if still connected
@@ -121,6 +122,7 @@ void MqttRTIambassador::disconnect()
       std::lock_guard<std::mutex> lock(_stateMutex);
       if (_joined)
          throw FederateIsExecutionMember(L"resign the federation execution before disconnecting");
+      momStopThread(); // still running after a lost connection; uses _transport
       transport = std::move(_transport);
       _connected = false;
    }
@@ -152,7 +154,16 @@ void MqttRTIambassador::enqueue(Callback cb)
 {
    {
       std::lock_guard<std::mutex> lock(_queueMutex);
-      _queue.push_back(std::move(cb));
+      _queue.push_back(QueuedCallback{std::move(cb), nullptr});
+   }
+   _queueCv.notify_all();
+}
+
+void MqttRTIambassador::enqueueInternal(std::function<void()> work)
+{
+   {
+      std::lock_guard<std::mutex> lock(_queueMutex);
+      _queue.push_back(QueuedCallback{nullptr, std::move(work)});
    }
    _queueCv.notify_all();
 }
@@ -164,22 +175,46 @@ bool MqttRTIambassador::deliverable() const
 
 void MqttRTIambassador::deliverOne(std::unique_lock<std::mutex>& lock)
 {
-   Callback cb = std::move(_queue.front());
+   QueuedCallback q = std::move(_queue.front());
    _queue.pop_front();
    FederateAmbassador* fa = _federateAmbassador.load();
    lock.unlock();
-   if (fa)
+   if (q.internal)
    {
-      CallbackScope scope;
       try
       {
-         cb(*fa);
+         q.internal(); // MOM HLAservice: a service call, not a callback
       }
       catch (...)
       {
-         // FederateInternalError or anything else thrown by the federate:
-         // must not escape into the RTI threads.
       }
+   }
+   else if (fa)
+   {
+      std::wstring failure;
+      {
+         CallbackScope scope;
+         try
+         {
+            q.cb(*fa);
+         }
+         catch (Exception const& e)
+         {
+            failure = e.what();
+         }
+         catch (std::exception const& e)
+         {
+            failure = fromUtf8(e.what());
+         }
+         catch (...)
+         {
+            // Anything else thrown by the federate must not escape into the
+            // RTI threads.
+            failure = L"unknown exception";
+         }
+      }
+      if (!failure.empty())
+         momReportCallbackException(failure); // MOM HLAsetExceptionReporting
    }
    lock.lock();
 }

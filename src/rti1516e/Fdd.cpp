@@ -279,7 +279,9 @@ struct FddBuilder
       if (name.empty())
          reading(label, "dimension without a name");
       std::string const ub = e.value("upperBound");
-      unsigned long upper = 0;
+      // No upper bound (HLAfederate of the standard MIM, normalized by
+      // normalizeFederateHandle): the whole 32-bit range.
+      unsigned long upper = 0xFFFFFFFFul;
       if (!ub.empty() && ub != "NA")
       {
          char* end = nullptr;

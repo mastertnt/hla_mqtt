@@ -42,7 +42,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   `getUpdateRateValueForAttribute` ; `retract` est dans `MqttTime.cpp` (message `WireKind::Retract`).
 - `src/rti1516e/MqttRegions.cpp` : DDM (régions, associations de mise à jour, abonnements avec régions,
   10.28 à 10.30) ; abonnement effectif = union abonnement sans région / avec régions
-  (`recomputeSubscriptions`) ; régions de mise à jour publiées dans l'enregistrement `info`.
+  (`recomputeSubscriptions`) ; régions de mise à jour publiées dans l'enregistrement `info` ; filtrage
+  par recouvrement à la réception (`subscriptionCovers`, `interactionCovers`, `Extents.h`).
 - `src/rti1516e/Trace.cpp` : `HLA_MQTT_TRACE` (Windows), trace des exceptions HLA levées par la DLL.
 - `src/rti1516e/Fdd.*` : FDD fusionné, handles = FNV-1a 64 du nom qualifié ; `Xml.*`, `Json.h` : parseurs maison
   (pas de dépendance ajoutée).
@@ -60,6 +61,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/objects/main.cpp` : `hla-objects-test` (broker requis), même FOM `foms/base.xml`.
 - `tests/time/main.cpp` : `hla-time-test` (broker requis), synchronisation et temps.
 - `tests/ddm/main.cpp` : `hla-ddm-test` (broker requis), services DDM 9.2 à 9.11 et 10.28 à 10.30.
+- `tests/mom/main.cpp` : `hla-mom-test` (broker requis), MOM (`src/rti1516e/MqttMom.cpp`).
+- `mim/HLAstandardMIM.xml` : MIM standard intégré à la DLL (tableau d'octets généré par `cmake/EmbedFile.cmake`).
 
 ## État au 2026-11-23
 - **Jalon 1 fait** : connect/disconnect, callbacks `HLA_EVOKED` et `HLA_IMMEDIATE`, `connectionLost`,
@@ -73,7 +76,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - **Jalon 2 fait** (2026-11-23) : gestion de fédération + services de support liés au FDD.
   `hla-federation-test` 57/57 en Release et Debug (6 exécutions de suite, courses comprises), selftest 14/14,
   aucun topic retained laissé sur le broker. **Pas encore compilé sous Linux/GCC.**
-  Pas de MOM (seuls HLAobjectRoot avec HLAprivilegeToDeleteObject et HLAinteractionRoot sont prédéfinis).
+  MOM ajouté depuis (issues #34 à #37).
 - **Jalon 3 fait** (2026-11-23) : déclarations, objets, interactions, réservation de noms, requêtes de mise
   à jour, commutateurs d'avis mémorisés (sans callbacks). `hla-objects-test` 44/44 en Release et Debug
   (4 exécutions), ~2000 mises à jour/s mesurées dans un test mono-thread (borne basse). Broker propre après tests.
@@ -85,7 +88,14 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   ~160 pas/s (TAR, lookahead 1), ~140 pas/s (NER, lookahead 0). retract et change*OrderType faits depuis (issues #7, #8).
 - **DDM, issues #21 à #24** (2026-11-24) : régions, bornes (10.28 à 10.30), enregistrement avec régions,
   (dés)association, abonnements objets/interactions avec régions. `hla-ddm-test` 51/51 en Release, suite
-  complète verte. Pas encore de filtrage par recouvrement (un abonné avec régions reçoit tout).
+  complète verte.
+- **DDM, issues #25 à #27** (2026-11-25) : envoi et requête avec régions, filtrage par recouvrement, avis de
+  portée et de pertinence avec régions. `hla-ddm-test` 70/70 (3 exécutions), suite complète verte.
+  Découverte non filtrée ; `conveyRegionDesignatorSets` non géré.
+- **MOM, issues #34 à #37** (2026-11-25) : MIM standard fusionné à la création, objets HLAfederate (un par
+  fédéré, valeurs calculées) et HLAfederation (locale), HLArequest/HLAreport, HLAadjust, HLAservice (file
+  interne hors portée de callback), HLAreportFederateLost. `hla-mom-test` 50/50 (4 exécutions), suite verte.
+  Rapport d'invocation limité aux services MOM ; propriété et sauvegarde répondent HLAreportMOMexception.
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 
@@ -117,12 +127,13 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - CMake 4 refuse `cmake_minimum_required` < 3.5 (paho-mqtt-c) : `CMAKE_POLICY_VERSION_MINIMUM=3.5`
   est défini dans les profils (`[env]`) et dans `build-vs2019.bat`.
 - Avertissements C4251/C4275 : inhérents à l'API standard, neutralisés par `/wd4251 /wd4275`.
+- `Octet` est un `char` signé : convertir en `unsigned char` avant de recomposer un entier (handles MOM).
+- `for (x : Json::parse(s)["k"].items())` lit un temporaire détruit : garder le `Json` dans une variable.
 
 ## Suite prévue
 1. `check_imports.py` sur un vrai fédéré (selftest Windows validé).
 2. Compiler et tester l'encodage sous Linux/GCC.
 3. Tester la substitution de DLL sur un vrai fédéré dès qu'un exécutable est disponible.
-4. Option de build « version d'éditeur de liens PE » (compatibilité VR-Link), MIM standard (HLAmanager).
+4. Option de build « version d'éditeur de liens PE » (compatibilité VR-Link).
 5. Propriété, sauvegarde/restauration.
-6. DDM : envoi avec régions, filtrage par recouvrement et avis de portée (issues GitHub #25, #26, #27).
 5. Effacer la présence `offline` retained d'un client disparu (aujourd'hui elle reste sur le broker).

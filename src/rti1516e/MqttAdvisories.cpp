@@ -10,8 +10,13 @@
 //   - attribute relevance: turnUpdatesOnForObjectInstance for the attributes it
 //     owns that a subscriber receives, i.e. that the subscriber subscribed at
 //     the class it knows the object by; turnUpdatesOff when that stops;
-//   - attribute scope: attributesInScope at discovery, for the subscribed
-//     attributes owned by another federate (no DDM: in scope until removed).
+//   - attribute scope: attributesInScope / attributesOutOfScope for the
+//     subscribed attributes of discovered objects that another federate owns
+//     and whose update regions overlap the subscription regions (DDM); the
+//     scope is evaluated again when regions, subscriptions or ownership change.
+// Subscriptions with regions only travel as "or": {"<class>": {"<attribute>":
+// [extents, ...]}}: an owner counts such an attribute relevant only when its
+// update regions overlap them.
 // The callbacks follow the advisory switches (initial values from the FOM
 // <switches>, else disabled). Disabling a switch stops the callbacks without
 // "off" notifications; enabling it again notifies the current state.
@@ -49,6 +54,23 @@ std::string MqttRTIambassador::declarationsPayload() const
    Json i = Json::array();
    for (std::uint64_t c : _subscribedInteractions)
       i.push(hex64(c));
+   Json regionOnly = Json::object(); // DDM: attributes subscribed with regions only
+   for (auto const& cls : _regionSubscribedAttributes)
+   {
+      auto plain = _plainSubscribedAttributes.find(cls.first);
+      Json attrs = Json::object();
+      for (auto const& attr : cls.second)
+      {
+         if (attr.second.empty() || (plain != _plainSubscribedAttributes.end() && plain->second.count(attr.first)))
+            continue;
+         Json list = Json::array();
+         for (Extents const& e : ownExtents(attr.second))
+            list.push(extentsToJson(e));
+         attrs.set(hex64(attr.first), list);
+      }
+      if (!attrs.members().empty())
+         regionOnly.set(hex64(cls.first), attrs);
+   }
    Json it = Json::object(); // 6.27 transportation changes, needed by queries and receivers
    for (auto const& kv : _interactionTransport)
       it.set(hex64(kv.first), kv.second);
@@ -59,6 +81,8 @@ std::string MqttRTIambassador::declarationsPayload() const
    j.set("i", i);
    if (!it.members().empty())
       j.set("it", it);
+   if (!regionOnly.members().empty())
+      j.set("or", regionOnly);
    return j.dump();
 }
 
@@ -102,6 +126,10 @@ void MqttRTIambassador::handleDeclarations(std::string const& hexHandle, std::st
             d.interactions.insert(parseHex(c));
          for (auto const& kv : j["it"].members())
             d.interactionTransport[parseHex(kv.first)] = kv.second.str();
+         for (auto const& cls : j["or"].members())
+            for (auto const& attr : cls.second.members())
+               for (Json const& e : attr.second.items())
+                  d.regionOnly[parseHex(cls.first)][parseHex(attr.first)].push_back(extentsFromJson(e));
          _remoteDecl[h] = d;
       }
       catch (std::exception const&)
@@ -215,9 +243,19 @@ void MqttRTIambassador::evaluateAdvisories()
          std::uint64_t const k = subscribedAncestor(d.second, o.objectClass);
          if (k == 0)
             continue;
+         auto regionOnly = d.second.regionOnly.find(k);
          for (std::uint64_t a : d.second.objects.at(k))
-            if (o.owned.count(a))
-               relevant.insert(a);
+         {
+            if (!o.owned.count(a))
+               continue;
+            if (regionOnly != d.second.regionOnly.end())
+            {
+               auto ra = regionOnly->second.find(a);
+               if (ra != regionOnly->second.end() && !anyOverlap(updateExtents(o, a), ra->second))
+                  continue; // subscribed with regions that our update regions miss
+            }
+            relevant.insert(a);
+         }
       }
       AttributeHandleSet on, off;
       for (std::uint64_t a : relevant)
@@ -233,23 +271,44 @@ void MqttRTIambassador::evaluateAdvisories()
       if (!off.empty())
          enqueue([h, off](FederateAmbassador& fa) { fa.turnUpdatesOffForObjectInstance(h, off); });
    }
+
+   evaluateScopes();
 }
 
-void MqttRTIambassador::notifyScope(ObjectInstance const& o)
+void MqttRTIambassador::evaluateScope(ObjectInstance& o)
 {
-   if (!_advisorySwitches[2] || o.knownClass == 0)
+   if (o.knownClass == 0 || o.owner == _federateHandle)
       return;
+   if (!_advisorySwitches[2])
+   {
+      o.scope.clear(); // enabling the switch again notifies the current scope
+      return;
+   }
+   std::set<std::uint64_t> scope;
    auto it = _subscribedAttributes.find(o.knownClass);
-   if (it == _subscribedAttributes.end())
-      return;
-   AttributeHandleSet inScope;
-   for (std::uint64_t a : it->second)
-      if (o.ownedRemote.count(a))
-         inScope.insert(AttributeHandleFriend::create(a));
-   if (inScope.empty())
-      return;
+   if (it != _subscribedAttributes.end())
+      for (std::uint64_t a : it->second)
+         if (o.ownedRemote.count(a) && subscriptionCovers(o.knownClass, a, updateExtents(o, a)))
+            scope.insert(a);
+   AttributeHandleSet in, out;
+   for (std::uint64_t a : scope)
+      if (!o.scope.count(a))
+         in.insert(AttributeHandleFriend::create(a));
+   for (std::uint64_t a : o.scope)
+      if (!scope.count(a))
+         out.insert(AttributeHandleFriend::create(a));
+   o.scope = scope;
    ObjectInstanceHandle const h = ObjectInstanceHandleFriend::create(o.handle);
-   enqueue([h, inScope](FederateAmbassador& fa) { fa.attributesInScope(h, inScope); });
+   if (!in.empty())
+      enqueue([h, in](FederateAmbassador& fa) { fa.attributesInScope(h, in); });
+   if (!out.empty())
+      enqueue([h, out](FederateAmbassador& fa) { fa.attributesOutOfScope(h, out); });
+}
+
+void MqttRTIambassador::evaluateScopes()
+{
+   for (auto& kv : _objects)
+      evaluateScope(kv.second);
 }
 
 void MqttRTIambassador::setAdvisorySwitch(int index, bool value)

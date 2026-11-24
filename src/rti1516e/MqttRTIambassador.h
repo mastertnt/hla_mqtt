@@ -11,6 +11,7 @@
 #include <RTI/RTI1516.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -31,9 +32,15 @@ using namespace rti1516e;
 class MqttTransport;
 class Fdd;
 }
+#include "Extents.h"
 #include "TimeValue.h"
 namespace hla_mqtt
 {
+struct MomCounts // MOM counters of one class, per transportation
+{
+   std::uint32_t reliable = 0;
+   std::uint32_t bestEffort = 0;
+};
 
 class MqttRTIambassador : public RTIambassador
 {
@@ -45,11 +52,17 @@ public:
 
 private:
    using Callback = std::function<void(FederateAmbassador&)>;
+   struct QueuedCallback
+   {
+      Callback cb;
+      std::function<void()> internal; // RTI work on the federate thread, outside callback scope
+   };
 
    [[noreturn]] void notImplemented(wchar_t const* service) const;
 
    void checkNotInCallback() const;
    void enqueue(Callback cb);
+   void enqueueInternal(std::function<void()> work);
    // Pops and runs one callback; `lock` is released while it runs.
    void deliverOne(std::unique_lock<std::mutex>& lock);
    bool deliverable() const; // requires _queueMutex
@@ -117,6 +130,9 @@ private:
       std::map<std::uint64_t, std::set<std::uint64_t>> updateRegions; // DDM: attribute -> our regions (9.5, 9.6)
       std::map<std::uint64_t, OrderType> order;       // 8.23 changeAttributeOrderType (own objects)
       std::map<std::uint64_t, std::string> transport; // 6.23 transportation changed by the owner (from info for others)
+      std::map<std::uint64_t, std::vector<Extents>> remoteRegions; // DDM: owner's update regions (from info)
+      std::set<std::uint64_t> scope; // attributes notified in scope (attributeScopeAdvisory)
+      bool mom = false; // local MOM entry (our HLAfederate, HLAfederation): values computed by the RTI
    };
 
    void subscribeJoinedTopics();
@@ -174,6 +190,8 @@ private:
       std::map<std::uint64_t, std::set<std::uint64_t>> objects; // class -> subscribed attributes
       std::set<std::uint64_t> interactions;
       std::map<std::uint64_t, std::string> interactionTransport; // 6.27, class -> transportation
+      // DDM: attributes subscribed with regions only (no default-region subscription): class -> attribute -> extents
+      std::map<std::uint64_t, std::map<std::uint64_t, std::vector<Extents>>> regionOnly;
    };
    std::map<std::uint64_t, RemoteDeclarations> _remoteDecl; // other federates' subscriptions
    std::set<std::uint64_t> _classRelevanceOn;
@@ -183,11 +201,11 @@ private:
    void publishDeclarations();                                                       // _viewMutex held (async)
    void handleDeclarations(std::string const& hexHandle, std::string const& payload); // _viewMutex held
    void evaluateAdvisories();                                                        // _viewMutex held
-   void notifyScope(ObjectInstance const& o);                                        // _viewMutex held
+   void evaluateScope(ObjectInstance& o);                                            // _viewMutex held
+   void evaluateScopes();                                                            // _viewMutex held
    void setAdvisorySwitch(int index, bool value);
 
    // ------------------------------------------- DDM regions (MqttRegions.cpp)
-   using Extents = std::map<std::uint64_t, std::pair<unsigned long, unsigned long>>; // dimension -> [lower, upper)
    struct Region
    {
       Extents pending;   // setRangeBounds
@@ -214,6 +232,78 @@ private:
    void publishInfoRecords(std::vector<std::pair<std::string, std::string>> const& records);
    ObjectInstanceHandle registerObject(ObjectClassHandle theClass, std::wstring const& name,
                                        AttributeHandleSetRegionHandleSetPairVector const* regions);
+   // Overlap filtering (_viewMutex held). An empty extents list is the default region.
+   std::vector<Extents> ownExtents(std::set<std::uint64_t> const& regions) const; // committed extents
+   std::vector<Extents> updateExtents(ObjectInstance const& o, std::uint64_t attribute) const;
+   // Our subscription to (cls, attribute) receives what was sent with `sent`.
+   bool subscriptionCovers(std::uint64_t cls, std::uint64_t attribute, std::vector<Extents> const& sent) const;
+   bool interactionCovers(std::uint64_t cls, std::vector<Extents> const& sent) const;
+   // _stateMutex held. `regions`: 9.12 sendInteractionWithRegions; `theTime`: time-stamped variant.
+   MessageRetractionHandle sendInteractionMessage(InteractionClassHandle theInteraction,
+                                                  ParameterHandleValueMap const& values,
+                                                  VariableLengthData const& tag, LogicalTime const* theTime,
+                                                  RegionHandleSet const* regions);
+   // _stateMutex held. `pairs`: 9.13 requestAttributeValueUpdateWithRegions.
+   void requestClassUpdate(ObjectClassHandle theClass, AttributeHandleSet const& attributes,
+                           AttributeHandleSetRegionHandleSetPairVector const* pairs, VariableLengthData const& tag);
+
+   // ------------------------------------------------------- MOM (MqttMom.cpp)
+   // Counters and switches: _viewMutex.
+   std::map<std::uint64_t, MomCounts> _momUpdatesSent, _momReflections, _momInteractionsSent, _momInteractionsReceived;
+   std::map<std::uint64_t, std::set<std::uint64_t>> _momInstancesUpdated, _momInstancesReflected; // class -> instances
+   long long _momDeleted = 0, _momRemoved = 0;
+   std::uint64_t _momFederateObject = 0;   // our HLAfederate instance
+   std::uint64_t _momFederationObject = 0; // local HLAfederation instance
+   std::vector<std::wstring> _momJoinModules; // FOM modules supplied at join: designators and contents
+   std::vector<std::string> _momJoinModuleData;
+   bool _momServiceReporting = false, _momExceptionReporting = false;
+   bool _conveyProducingFederate = false, _conveyRegionDesignatorSets = false, _autoProvide = false;
+   long long _momSerial = 0;
+   std::chrono::steady_clock::time_point _momClock;
+   double _momGrantedMs = 0, _momAdvancingMs = 0;
+   // HLAsetTiming thread (_momThreadMutex).
+   std::thread _momThread;
+   std::mutex _momThreadMutex;
+   std::condition_variable _momCv;
+   bool _momStop = false, _momPeriodChanged = false;
+   int _momReportPeriod = 0;
+
+   void momJoined(std::vector<std::wstring> const& designators, std::vector<std::string> const& contents); // no lock
+   void momResigning(); // _stateMutex held
+   void momThreadLoop();
+   void momStopThread(); // idempotent; no lock held
+   // The following require _viewMutex.
+   void momCountUpdate(std::uint64_t cls, std::uint64_t instance, bool bestEffort);
+   void momCountReflection(std::uint64_t cls, std::uint64_t instance, bool bestEffort);
+   void momCountInteraction(bool sent, std::uint64_t cls, bool bestEffort);
+   void momAccountTime();
+   SupplementalReflectInfo reflectInfo(std::uint64_t sender) const;
+   SupplementalReceiveInfo receiveInfo(std::uint64_t sender) const;
+   std::vector<std::string> momTopics() const; // broker subscriptions of the MOM requests
+   bool momHandles(std::uint64_t interactionClass) const;
+   bool momElected(std::uint64_t excluded) const; // smallest live handle (federation-level requests)
+   std::string momTimeBytes(TimeValue const& t) const;
+   std::string momIntervalBytes(TimeValue const& t) const;
+   std::map<std::string, VariableLengthData> momFederateValues();
+   std::map<std::string, VariableLengthData> momFederationValues() const;
+   void momModules(std::string& mimHash, std::wstring& mimDesignator, std::vector<std::string>& hashes,
+                   std::vector<std::wstring>& designators) const;
+   std::string momModuleContent(std::string const& hash) const;
+   AttributeHandleValueMap momValues(ObjectInstance const& o, std::set<std::uint64_t> const& attrs);
+   void momReflectLocal(ObjectInstance const& o, AttributeHandleValueMap const& values);
+   void momSendFederateUpdate(std::set<std::uint64_t> const& attrs); // empty = all
+   void momProvide(ObjectInstance const& o, std::set<std::uint64_t> const& attrs);
+   void momSend(std::string const& qualified, std::vector<std::pair<std::string, VariableLengthData>> const& params);
+   void momSendFederate(std::string const& report, std::vector<std::pair<std::string, VariableLengthData>> params);
+   void momException(std::wstring const& service, std::wstring const& what, bool parameterError);
+   void momFederateLost(std::string const& clientId);
+   void handleMomInteraction(std::uint64_t cls, std::map<std::uint64_t, std::string> const& params);
+   void momFederateRequest(std::string const& name, std::uint64_t cls, std::map<std::uint64_t, std::string> const& params);
+   void momFederationRequest(std::string const& name, std::uint64_t cls,
+                             std::map<std::uint64_t, std::string> const& params);
+   void momAdjust(std::string const& name, std::uint64_t cls, std::map<std::uint64_t, std::string> const& params);
+   void momService(std::string const& name, std::uint64_t cls, std::map<std::uint64_t, std::string> const& params);
+   void momReportCallbackException(std::wstring const& what); // no lock held
 
    // ------------------------------------- jalon 4: synchronization (MqttSync.cpp)
    struct SyncPoint
@@ -328,7 +418,7 @@ private:
    // Callback queue (guarded by _queueMutex)
    std::mutex _queueMutex;
    std::condition_variable _queueCv;
-   std::deque<Callback> _queue;
+   std::deque<QueuedCallback> _queue;
    bool _callbacksEnabled = true;
    bool _stopDispatcher = false;
    std::thread _dispatcher;

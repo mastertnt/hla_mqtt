@@ -221,6 +221,8 @@ void MqttRTIambassador::updateBrokerSubscriptions()
          if (!covered)
             wanted.insert(_fedTopic + "/interactions/" + classTopicPath(c->qualified) + "/#");
       }
+      for (std::string const& t : momTopics()) // MOM requests, handled whatever the subscriptions
+         wanted.insert(t);
    }
    try
    {
@@ -238,6 +240,7 @@ void MqttRTIambassador::updateBrokerSubscriptions()
    _coverTopics = wanted;
    std::lock_guard<std::mutex> v(_viewMutex);
    discoverPending();
+   evaluateScopes();
    publishDeclarations();
 }
 
@@ -255,7 +258,7 @@ void MqttRTIambassador::tryDiscover(ObjectInstance& o)
    ObjectClassHandle const known = ObjectClassHandleFriend::create(k);
    std::wstring const name = fromUtf8(o.name);
    enqueue([instance, known, name](FederateAmbassador& fa) { fa.discoverObjectInstance(instance, known, name); });
-   notifyScope(o);
+   evaluateScope(o);
 }
 
 void MqttRTIambassador::discoverPending()
@@ -280,6 +283,7 @@ void MqttRTIambassador::handlePresence(std::string const& clientId, std::string 
    }
    if (online)
       return;
+   momFederateLost(clientId); // HLAreportFederateLost, before the records go
    for (auto it = _objects.begin(); it != _objects.end();)
    {
       ObjectInstance const& o = it->second;
@@ -287,6 +291,7 @@ void MqttRTIambassador::handlePresence(std::string const& clientId, std::string 
       {
          if (o.knownClass != 0)
          {
+            ++_momRemoved;
             ObjectInstanceHandle const instance = ObjectInstanceHandleFriend::create(o.handle);
             enqueue([instance](FederateAmbassador& fa) {
                fa.removeObjectInstance(instance, VariableLengthData(), RECEIVE, SupplementalRemoveInfo());
@@ -315,6 +320,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             {
                if (it->second.knownClass != 0)
                {
+                  ++_momRemoved;
                   ObjectInstanceHandle const h = ObjectInstanceHandleFriend::create(instance);
                   enqueue([h](FederateAmbassador& fa) {
                      fa.removeObjectInstance(h, VariableLengthData(), RECEIVE, SupplementalRemoveInfo());
@@ -335,6 +341,9 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             o.ownedRemote.insert(parseHex(a));
          for (auto const& kv : j["transport"].members())
             o.transport[parseHex(kv.first)] = kv.second.str();
+         for (auto const& kv : j["regions"].members())
+            for (Json const& e : kv.second.items())
+               o.remoteRegions[parseHex(kv.first)].push_back(extentsFromJson(e));
          o.topic = _fedTopic + "/" + rest.substr(0, rest.size() - 5);
          if (o.owner == _federateHandle || !_fdd->objectClass(o.objectClass))
             return;
@@ -349,6 +358,9 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             it->second.ownerClient = o.ownerClient;
             it->second.ownedRemote = o.ownedRemote;
             it->second.transport = o.transport;
+            it->second.remoteRegions = o.remoteRegions;
+            if (it->second.knownClass != 0)
+               evaluateScope(it->second); // update regions may have moved
          }
          if (!it->second.locallyDeleted)
             tryDiscover(it->second);
@@ -386,34 +398,35 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          {
             std::uint64_t const a = r.u64();
             std::string const value = r.bytes();
-            if (!wanted.count(a))
-               continue;
+            if (!wanted.count(a) || !subscriptionCovers(o.knownClass, a, updateExtents(o, a)))
+               continue; // not subscribed, or no overlap of the regions
             values[AttributeHandleFriend::create(a)] = toVld(value);
             allBestEffort = allBestEffort && bestEffort(o, a);
          }
          if (values.empty())
             return;
+         momCountReflection(o.knownClass, instance, allBestEffort);
          ObjectInstanceHandle const h = ObjectInstanceHandleFriend::create(instance);
          VariableLengthData const t = toVld(tag);
          TransportationType const tt = allBestEffort ? BEST_EFFORT : RELIABLE;
+         SupplementalReflectInfo const info = reflectInfo(sender);
          std::shared_ptr<LogicalTime> lt = timeFlag ? decodeTime(time) : nullptr;
          if (lt && timeFlag == 2)
          {
             MessageRetractionHandle const mrh = MessageRetractionHandleFriend::create(retraction);
             deliverTimed(TimeValue::of(*lt, timeIsInteger()), true,
-                         [h, values, t, tt, lt, mrh](FederateAmbassador& fa, OrderType received) {
-                            fa.reflectAttributeValues(h, values, t, TIMESTAMP, tt, *lt, received, mrh,
-                                                      SupplementalReflectInfo());
+                         [h, values, t, tt, lt, mrh, info](FederateAmbassador& fa, OrderType received) {
+                            fa.reflectAttributeValues(h, values, t, TIMESTAMP, tt, *lt, received, mrh, info);
                          },
                          retraction);
          }
          else if (lt)
-            deliverRO([h, values, t, tt, lt](FederateAmbassador& fa) {
-               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, *lt, RECEIVE, SupplementalReflectInfo());
+            deliverRO([h, values, t, tt, lt, info](FederateAmbassador& fa) {
+               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
             });
          else
-            deliverRO([h, values, t, tt](FederateAmbassador& fa) {
-               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, SupplementalReflectInfo());
+            deliverRO([h, values, t, tt, info](FederateAmbassador& fa) {
+               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, info);
             });
          return;
       }
@@ -425,40 +438,48 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          std::string const time = timeFlag ? r.bytes() : std::string();
          std::uint64_t const retraction = r.u64();
          std::uint32_t const n = r.u32();
+         std::map<std::uint64_t, std::string> raw;
+         for (std::uint32_t k = 0; k < n; ++k)
+         {
+            std::uint64_t const p = r.u64();
+            raw[p] = r.bytes();
+         }
+         if (momHandles(cls))
+            handleMomInteraction(cls, raw); // MOM request, adjustment or service
          std::uint64_t const received = receivedInteractionClass(cls);
          if (received == 0)
             return;
          ParameterHandleValueMap values;
-         for (std::uint32_t k = 0; k < n; ++k)
-         {
-            std::uint64_t const p = r.u64();
-            std::string const value = r.bytes();
-            if (_fdd->classHasParameter(received, p))
-               values[ParameterHandleFriend::create(p)] = toVld(value);
-         }
+         for (auto const& kv : raw)
+            if (_fdd->classHasParameter(received, kv.first))
+               values[ParameterHandleFriend::create(kv.first)] = toVld(kv.second);
+         std::vector<Extents> const sentRegions = r.atEnd() ? std::vector<Extents>() : readExtents(r);
+         if (!interactionCovers(received, sentRegions))
+            return; // no overlap with the subscription regions
          if (!_fdd->interactionClass(cls))
             return;
          TransportationType const tt = interactionBestEffort(sender, cls) ? BEST_EFFORT : RELIABLE;
+         momCountInteraction(false, received, tt == BEST_EFFORT);
          InteractionClassHandle const h = InteractionClassHandleFriend::create(received);
          VariableLengthData const t = toVld(tag);
+         SupplementalReceiveInfo const info = receiveInfo(sender);
          std::shared_ptr<LogicalTime> lt = timeFlag ? decodeTime(time) : nullptr;
          if (lt && timeFlag == 2)
          {
             MessageRetractionHandle const mrh = MessageRetractionHandleFriend::create(retraction);
             deliverTimed(TimeValue::of(*lt, timeIsInteger()), true,
-                         [h, values, t, tt, lt, mrh](FederateAmbassador& fa, OrderType receivedOrder) {
-                            fa.receiveInteraction(h, values, t, TIMESTAMP, tt, *lt, receivedOrder, mrh,
-                                                  SupplementalReceiveInfo());
+                         [h, values, t, tt, lt, mrh, info](FederateAmbassador& fa, OrderType receivedOrder) {
+                            fa.receiveInteraction(h, values, t, TIMESTAMP, tt, *lt, receivedOrder, mrh, info);
                          },
                          retraction);
          }
          else if (lt)
-            deliverRO([h, values, t, tt, lt](FederateAmbassador& fa) {
-               fa.receiveInteraction(h, values, t, RECEIVE, tt, *lt, RECEIVE, SupplementalReceiveInfo());
+            deliverRO([h, values, t, tt, lt, info](FederateAmbassador& fa) {
+               fa.receiveInteraction(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
             });
          else
-            deliverRO([h, values, t, tt](FederateAmbassador& fa) {
-               fa.receiveInteraction(h, values, t, RECEIVE, tt, SupplementalReceiveInfo());
+            deliverRO([h, values, t, tt, info](FederateAmbassador& fa) {
+               fa.receiveInteraction(h, values, t, RECEIVE, tt, info);
             });
          return;
       }
@@ -475,6 +496,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          _objects.erase(it);
          if (!discovered)
             return;
+         ++_momRemoved;
          ObjectInstanceHandle const h = ObjectInstanceHandleFriend::create(instance);
          VariableLengthData const t = toVld(tag);
          std::shared_ptr<LogicalTime> lt = timeFlag ? decodeTime(time) : nullptr;
@@ -503,7 +525,26 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          std::set<std::uint64_t> attrs;
          for (std::uint32_t k = 0; k < n; ++k)
             attrs.insert(r.u64());
+         // 9.13: (attributes, extents) pairs; an attribute is provided when its
+         // update regions overlap the regions of a pair naming it.
+         std::vector<std::pair<std::set<std::uint64_t>, std::vector<Extents>>> pairs;
+         if (!r.atEnd())
+         {
+            std::uint32_t const count = r.u32();
+            for (std::uint32_t k = 0; k < count && k < 4096; ++k)
+            {
+               std::set<std::uint64_t> pa;
+               std::uint32_t const m = r.u32();
+               for (std::uint32_t q = 0; q < m; ++q)
+                  pa.insert(r.u64());
+               pairs.emplace_back(pa, readExtents(r));
+            }
+         }
          VariableLengthData const t = toVld(tag);
+         auto mom = _objects.find(_momFederateObject); // our HLAfederate: values provided by the RTI
+         if (mom != _objects.end() &&
+             (instance != 0 ? instance == mom->first : isSubclassOf(mom->second.objectClass, cls)))
+            momSendFederateUpdate(attrs);
          for (auto const& kv : _objects)
          {
             ObjectInstance const& o = kv.second;
@@ -513,8 +554,15 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
                continue;
             AttributeHandleSet provide;
             for (std::uint64_t a : attrs)
-               if (o.owned.count(a))
+            {
+               if (!o.owned.count(a))
+                  continue;
+               bool inRegion = pairs.empty();
+               for (auto const& pair : pairs)
+                  inRegion = inRegion || (pair.first.count(a) && anyOverlap(updateExtents(o, a), pair.second));
+               if (inRegion)
                   provide.insert(AttributeHandleFriend::create(a));
+            }
             if (provide.empty())
                continue;
             ObjectInstanceHandle const h = ObjectInstanceHandleFriend::create(o.handle);
@@ -981,6 +1029,7 @@ void MqttRTIambassador::updateAttributeValues(ObjectInstanceHandle theObject,
       }
       topic = o.topic + "/update";
       w.u64(_federateHandle).u64(nextSeq()).u64(o.handle);
+      momCountUpdate(o.objectClass, o.handle, qos == 0);
    }
    w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u8(0).u64(0);
    w.u32(std::uint32_t(theAttributeValues.size()));
@@ -1034,6 +1083,7 @@ MessageRetractionHandle MqttRTIambassador::updateAttributeValues(ObjectInstanceH
       for (auto const& kv : parts[k])
          w.u64(AttributeHandleFriend::value(kv.first)).bytes(kv.second.data(), kv.second.size());
       sendUpdate(*_transport, o.topic + "/update", w, qos[k]);
+      momCountUpdate(o.objectClass, o.handle, qos[k] == 0);
       if (k == 1 && tso)
          rememberSentTso(retraction, ts, o.topic + "/update");
    }
@@ -1057,27 +1107,7 @@ void MqttRTIambassador::sendInteraction(InteractionClassHandle theInteraction,
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
-   std::string topic;
-   int qos = 1;
-   std::uint64_t const c = InteractionClassHandleFriend::value(theInteraction);
-   {
-      std::lock_guard<std::mutex> v(_viewMutex);
-      Fdd::InteractionClass const* ic = _fdd->interactionClass(c);
-      if (!ic)
-         throw InteractionClassNotDefined(theInteraction.toString());
-      if (!_publishedInteractions.count(c))
-         throw InteractionClassNotPublished(theInteraction.toString());
-      for (auto const& kv : theParameterValues)
-         if (!_fdd->classHasParameter(c, ParameterHandleFriend::value(kv.first)))
-            throw InteractionParameterNotDefined(kv.first.toString());
-      topic = _fedTopic + "/interactions/" + classTopicPath(ic->qualified) + "/@";
-      qos = interactionBestEffort(_federateHandle, c) ? 0 : 1;
-   }
-   WireWriter w(WireKind::Interaction);
-   w.u64(_federateHandle).u64(nextSeq()).u64(c);
-   w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u8(0).u64(0);
-   writeParameters(w, theParameterValues);
-   sendUpdate(*_transport, topic, w, qos);
+   sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, nullptr, nullptr);
 }
 
 MessageRetractionHandle MqttRTIambassador::sendInteraction(InteractionClassHandle theInteraction,
@@ -1087,30 +1117,68 @@ MessageRetractionHandle MqttRTIambassador::sendInteraction(InteractionClassHandl
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
-   std::string const time = encodeTime(theTime);
+   return sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, &theTime, nullptr);
+}
+
+// Wire: sender, seq, class, tag, time flag [, time], retraction, parameters,
+// then the extents of the regions (9.12; none = default region).
+MessageRetractionHandle MqttRTIambassador::sendInteractionMessage(InteractionClassHandle theInteraction,
+                                                                  ParameterHandleValueMap const& values,
+                                                                  VariableLengthData const& tag,
+                                                                  LogicalTime const* theTime,
+                                                                  RegionHandleSet const* regions)
+{
+   std::string const time = theTime ? encodeTime(*theTime) : std::string();
    std::uint64_t const c = InteractionClassHandleFriend::value(theInteraction);
-   std::uint64_t const retraction = newUniqueValue("R");
+   std::uint64_t const retraction = theTime ? newUniqueValue("R") : 0;
    std::lock_guard<std::mutex> v(_viewMutex);
    Fdd::InteractionClass const* ic = _fdd->interactionClass(c);
    if (!ic)
       throw InteractionClassNotDefined(theInteraction.toString());
    if (!_publishedInteractions.count(c))
       throw InteractionClassNotPublished(theInteraction.toString());
-   for (auto const& kv : theParameterValues)
+   for (auto const& kv : values)
       if (!_fdd->classHasParameter(c, ParameterHandleFriend::value(kv.first)))
          throw InteractionParameterNotDefined(kv.first.toString());
-   TimeValue const ts = TimeValue::of(theTime, timeIsInteger());
-   bool const tso = sendsTso(interactionTimestampOrder(c), ts);
+   std::vector<Extents> sent;
+   if (regions)
+   {
+      for (RegionHandle const& r : *regions)
+         ownRegion(r);
+      for (RegionHandle const& r : *regions)
+         checkRegionContext(RegionHandleFriend::value(r), ic->dimensions);
+      for (RegionHandle const& r : *regions)
+         sent.push_back(_regions.at(RegionHandleFriend::value(r)).committed);
+   }
+   bool tso = false;
+   TimeValue ts = TimeValue::zero(timeIsInteger());
+   if (theTime)
+   {
+      ts = TimeValue::of(*theTime, timeIsInteger());
+      tso = sendsTso(interactionTimestampOrder(c), ts);
+   }
    WireWriter w(WireKind::Interaction);
    w.u64(_federateHandle).u64(nextSeq()).u64(c);
-   w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u8(tso ? 2 : 1).bytes(time.data(), time.size());
+   w.bytes(tag.data(), tag.size()).u8(theTime ? (tso ? 2 : 1) : 0);
+   if (theTime)
+      w.bytes(time.data(), time.size());
    w.u64(retraction);
-   writeParameters(w, theParameterValues);
+   writeParameters(w, values);
+   writeExtents(w, sent);
    std::string const topic = _fedTopic + "/interactions/" + classTopicPath(ic->qualified) + "/@";
-   sendUpdate(*_transport, topic, w, tso || !interactionBestEffort(_federateHandle, c) ? 1 : 0);
+   bool const bestEffort = !tso && interactionBestEffort(_federateHandle, c);
+   sendUpdate(*_transport, topic, w, bestEffort ? 0 : 1);
+   momCountInteraction(true, c, bestEffort);
    if (tso)
       rememberSentTso(retraction, ts, topic);
-   return MessageRetractionHandleFriend::create(retraction);
+   if (momHandles(c)) // a MOM request about ourselves: our own messages do not come back
+   {
+      std::map<std::uint64_t, std::string> raw;
+      for (auto const& kv : values)
+         raw[ParameterHandleFriend::value(kv.first)] = tagBytes(kv.second);
+      handleMomInteraction(c, raw);
+   }
+   return theTime ? MessageRetractionHandleFriend::create(retraction) : MessageRetractionHandle();
 }
 
 // 6.14
@@ -1141,6 +1209,7 @@ void MqttRTIambassador::deleteObjectInstance(ObjectInstanceHandle theObject, Var
          throw DeletePrivilegeNotHeld(theObject.toString());
       o = it->second;
       _objects.erase(it);
+      ++_momDeleted;
    }
    try
    {
@@ -1172,6 +1241,7 @@ MessageRetractionHandle MqttRTIambassador::deleteObjectInstance(ObjectInstanceHa
       tso = sendsTso(priv && timestampOrder(it->second, priv->handle), TimeValue::of(theTime, timeIsInteger()));
       o = it->second;
       _objects.erase(it);
+      ++_momDeleted;
    }
    try
    {
@@ -1197,6 +1267,7 @@ void MqttRTIambassador::localDeleteObjectInstance(ObjectInstanceHandle theObject
       throw FederateOwnsAttributes(theObject.toString());
    it->second.knownClass = 0;
    it->second.locallyDeleted = true;
+   it->second.scope.clear();
 }
 
 // 6.19
@@ -1216,6 +1287,14 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectInstanceHandle theObje
       cls = it->second.objectClass;
       owner = it->second.owner;
       HLA_MQTT_CHECK_ATTRIBUTES(cls, theAttributes)
+      if (it->second.mom) // our HLAfederate or the HLAfederation object
+      {
+         std::set<std::uint64_t> attrs;
+         for (AttributeHandle const& a : theAttributes)
+            attrs.insert(AttributeHandleFriend::value(a));
+         momProvide(it->second, attrs);
+         return;
+      }
    }
    if (owner == 0 || owner == _federateHandle)
       return; // no owner, or attributes owned by the requester: nothing to provide
@@ -1232,18 +1311,56 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectClassHandle theClass, 
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   requestClassUpdate(theClass, theAttributes, nullptr, theUserSuppliedTag);
+}
+
+// Wire: sender, seq, 0, class, tag, attributes, then (9.13) the pairs:
+// u32 count, per pair u32 attributes + handles and the extents of its regions.
+void MqttRTIambassador::requestClassUpdate(ObjectClassHandle theClass, AttributeHandleSet const& attributes,
+                                           AttributeHandleSetRegionHandleSetPairVector const* pairs,
+                                           VariableLengthData const& tag)
+{
    std::string topic;
+   std::vector<std::vector<Extents>> extents;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
-      HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, theAttributes)
+      HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, attributes)
+      if (pairs)
+      {
+         checkRegionPairs(theClassValue, *pairs);
+         for (auto const& pair : *pairs)
+         {
+            std::set<std::uint64_t> handles;
+            for (RegionHandle const& r : pair.second)
+               handles.insert(RegionHandleFriend::value(r));
+            extents.push_back(ownExtents(handles));
+         }
+      }
       topic = _fedTopic + "/classrequests/" + classTopicPath(_fdd->objectClass(theClassValue)->qualified) + "/@";
+      std::set<std::uint64_t> attrs;
+      for (AttributeHandle const& a : attributes)
+         attrs.insert(AttributeHandleFriend::value(a));
+      for (auto const& kv : _objects) // local MOM entries: our own request does not come back
+         if (kv.second.mom && isSubclassOf(kv.second.objectClass, theClassValue))
+            momProvide(kv.second, attrs);
    }
    WireWriter w(WireKind::Request);
    w.u64(_federateHandle).u64(nextSeq()).u64(0).u64(ObjectClassHandleFriend::value(theClass));
-   w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u32(std::uint32_t(theAttributes.size()));
-   for (AttributeHandle const& a : theAttributes)
+   w.bytes(tag.data(), tag.size()).u32(std::uint32_t(attributes.size()));
+   for (AttributeHandle const& a : attributes)
       w.u64(AttributeHandleFriend::value(a));
+   if (pairs)
+   {
+      w.u32(std::uint32_t(pairs->size()));
+      for (size_t k = 0; k < pairs->size(); ++k)
+      {
+         w.u32(std::uint32_t((*pairs)[k].first.size()));
+         for (AttributeHandle const& a : (*pairs)[k].first)
+            w.u64(AttributeHandleFriend::value(a));
+         writeExtents(w, extents[k]);
+      }
+   }
    sendUpdate(*_transport, topic, w, 1);
 }
 

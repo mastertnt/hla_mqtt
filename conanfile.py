@@ -18,7 +18,7 @@ class HlaMqttRtiConan(ConanFile):
         "use_unique_ptr": False,
         "library_name": "rti1516e",
     }
-    exports_sources = "CMakeLists.txt", "include/*", "src/*", "tests/*", "tools/*"
+    exports_sources = "CMakeLists.txt", "cmake/*", "include/*", "mim/*", "src/*", "tests/*", "tools/*"
 
     def configure(self):
         # Paho linked statically into the RTI DLL: federates only need rti1516e.dll

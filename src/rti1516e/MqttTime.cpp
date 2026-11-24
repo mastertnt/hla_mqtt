@@ -339,6 +339,7 @@ void MqttRTIambassador::evaluateTime()
                _tsoQueue.erase(_tsoQueue.begin());
                enqueue([cb](FederateAmbassador& fa) { cb(fa, TIMESTAMP); });
             }
+            momAccountTime();
             _time.time = next;
             _time.advance = Advance::None;
             _time.lastGrantOpen = !available;
@@ -640,6 +641,7 @@ void MqttRTIambassador::startAdvance(Advance kind, LogicalTime const& theTime)
    TimeValue const t = TimeValue::of(theTime, timeIsInteger());
    if (t < _time.time)
       throw LogicalTimeAlreadyPassed(theTime.toString());
+   momAccountTime();
    _time.advance = kind;
    _time.requested = t;
    for (Callback& cb : _roHeld) // RO messages are delivered while advancing
