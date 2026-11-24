@@ -56,6 +56,7 @@ add_library(rti1516e SHARED
   src/rti1516e/MqttSync.cpp
   src/rti1516e/MqttTime.cpp
   src/rti1516e/MqttAdvisories.cpp
+  src/rti1516e/MqttRegions.cpp
   src/rti1516e/Trace.cpp
   src/rti1516e/Fdd.cpp
   src/rti1516e/Xml.cpp
@@ -166,6 +167,17 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
     set_property(TARGET hla-time-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   endif()
   add_test(NAME time COMMAND hla-time-test)
+
+  # Data distribution management: needs a broker.
+  add_executable(hla-ddm-test tests/ddm/main.cpp)
+  target_link_libraries(hla-ddm-test PRIVATE rti1516e)
+  target_compile_definitions(hla-ddm-test PRIVATE
+    HLA_TEST_FOM_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/federation/foms")
+  if(MSVC)
+    target_compile_options(hla-ddm-test PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-ddm-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME ddm COMMAND hla-ddm-test)
 endif()
 
 # ---------------------------------------------------------------- install
@@ -176,5 +188,5 @@ install(TARGETS rti1516e fedtime1516e
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/RTI DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(HLA_MQTT_RTI_BUILD_TESTS)
-  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

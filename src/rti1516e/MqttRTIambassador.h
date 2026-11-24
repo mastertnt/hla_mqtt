@@ -114,6 +114,7 @@ private:
       std::set<std::uint64_t> owned;   // attributes owned by us (own objects)
       std::set<std::uint64_t> ownedRemote; // attributes owned by the owner (from its info record)
       std::set<std::uint64_t> relevant;    // attributes notified by turnUpdatesOn (own objects)
+      std::map<std::uint64_t, std::set<std::uint64_t>> updateRegions; // DDM: attribute -> our regions (9.5, 9.6)
    };
 
    void subscribeJoinedTopics();
@@ -141,6 +142,9 @@ private:
 
    std::map<std::uint64_t, ObjectInstance> _objects; // own + seen from info records
    std::map<std::uint64_t, std::set<std::uint64_t>> _publishedAttributes;
+   // Effective subscriptions: union of the default-region subscriptions (5.6,
+   // 5.8) and of the subscriptions with regions (9.8, 9.10), see
+   // recomputeSubscriptions().
    std::map<std::uint64_t, std::set<std::uint64_t>> _subscribedAttributes;
    std::set<std::uint64_t> _publishedInteractions;
    std::set<std::uint64_t> _subscribedInteractions;
@@ -169,6 +173,35 @@ private:
    void evaluateAdvisories();                                                        // _viewMutex held
    void notifyScope(ObjectInstance const& o);                                        // _viewMutex held
    void setAdvisorySwitch(int index, bool value);
+
+   // ------------------------------------------- DDM regions (MqttRegions.cpp)
+   using Extents = std::map<std::uint64_t, std::pair<unsigned long, unsigned long>>; // dimension -> [lower, upper)
+   struct Region
+   {
+      Extents pending;   // setRangeBounds
+      Extents committed; // commitRegionModifications
+   };
+   std::map<std::uint64_t, Region> _regions; // created by this federate
+   std::atomic<std::uint32_t> _regionCounter{0};
+   std::map<std::uint64_t, std::set<std::uint64_t>> _plainSubscribedAttributes; // class -> attributes
+   std::map<std::uint64_t, std::map<std::uint64_t, std::set<std::uint64_t>>> _regionSubscribedAttributes; // class -> attribute -> regions
+   std::set<std::uint64_t> _plainSubscribedInteractions;
+   std::map<std::uint64_t, std::set<std::uint64_t>> _regionSubscribedInteractions; // class -> regions
+   // The following require _viewMutex.
+   void recomputeSubscriptions();
+   std::uint64_t ownRegion(RegionHandle const& h) const; // InvalidRegion, RegionNotCreatedByThisFederate
+   // Checks the attributes (defined for `cls`), the regions and, with
+   // `context`, that each region only spans dimensions of its attributes.
+   void checkRegionPairs(std::uint64_t cls, AttributeHandleSetRegionHandleSetPairVector const& pairs,
+                         bool context = true) const;
+   void checkRegionContext(std::uint64_t region, std::vector<std::string> const& dimensionNames) const;
+   bool regionInUse(std::uint64_t region) const;
+   std::string objectInfo(ObjectInstance const& o) const; // retained info record, with the update regions
+   // Info records of our objects whose update regions changed: (topic, payload).
+   std::vector<std::pair<std::string, std::string>> infoRecordsUsing(std::set<std::uint64_t> const& regions) const;
+   void publishInfoRecords(std::vector<std::pair<std::string, std::string>> const& records);
+   ObjectInstanceHandle registerObject(ObjectClassHandle theClass, std::wstring const& name,
+                                       AttributeHandleSetRegionHandleSetPairVector const* regions);
 
    // ------------------------------------- jalon 4: synchronization (MqttSync.cpp)
    struct SyncPoint

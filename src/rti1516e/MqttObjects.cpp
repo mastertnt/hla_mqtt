@@ -183,6 +183,11 @@ void MqttRTIambassador::resetObjectState()
    _classRelevanceOn.clear();
    _interactionRelevanceOn.clear();
    _lastDeclarations.clear();
+   _regions.clear();
+   _plainSubscribedAttributes.clear();
+   _regionSubscribedAttributes.clear();
+   _plainSubscribedInteractions.clear();
+   _regionSubscribedInteractions.clear();
 }
 
 void MqttRTIambassador::updateBrokerSubscriptions()
@@ -621,8 +626,10 @@ void MqttRTIambassador::subscribeObjectClassAttributes(ObjectClassHandle theClas
       double rate = 0;
       if (!updateRateDesignator.empty() && !_fdd->updateRate(toUtf8(updateRateDesignator), rate))
          throw InvalidUpdateRateDesignator(updateRateDesignator);
-      forEachAttribute(attributeList,
-                       [&](std::uint64_t av, AttributeHandle const&) { _subscribedAttributes[theClassValue].insert(av); });
+      forEachAttribute(attributeList, [&](std::uint64_t av, AttributeHandle const&) {
+         _plainSubscribedAttributes[theClassValue].insert(av);
+      });
+      recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
 }
@@ -635,7 +642,8 @@ void MqttRTIambassador::unsubscribeObjectClass(ObjectClassHandle theClass)
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
-      _subscribedAttributes.erase(theClassValue);
+      _plainSubscribedAttributes.erase(theClassValue); // subscriptions with regions stay (9.9)
+      recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
 }
@@ -649,13 +657,14 @@ void MqttRTIambassador::unsubscribeObjectClassAttributes(ObjectClassHandle theCl
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
       HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, attributeList)
-      auto it = _subscribedAttributes.find(theClassValue);
-      if (it != _subscribedAttributes.end())
+      auto it = _plainSubscribedAttributes.find(theClassValue);
+      if (it != _plainSubscribedAttributes.end())
       {
          forEachAttribute(attributeList, [&](std::uint64_t av, AttributeHandle const&) { it->second.erase(av); });
          if (it->second.empty())
-            _subscribedAttributes.erase(it);
+            _plainSubscribedAttributes.erase(it);
       }
+      recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
 }
@@ -670,7 +679,8 @@ void MqttRTIambassador::subscribeInteractionClass(InteractionClassHandle theClas
       std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
       if (!_fdd->interactionClass(c))
          throw InteractionClassNotDefined(theClass.toString());
-      _subscribedInteractions.insert(c);
+      _plainSubscribedInteractions.insert(c);
+      recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
 }
@@ -685,7 +695,8 @@ void MqttRTIambassador::unsubscribeInteractionClass(InteractionClassHandle theCl
       std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
       if (!_fdd->interactionClass(c))
          throw InteractionClassNotDefined(theClass.toString());
-      _subscribedInteractions.erase(c);
+      _plainSubscribedInteractions.erase(c);
+      recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
 }
@@ -844,13 +855,33 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstance(ObjectClassHandle
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   return registerObject(theClass, theObjectInstanceName, nullptr);
+}
+
+// _stateMutex held. `regions`: 9.5 registerObjectInstanceWithRegions.
+ObjectInstanceHandle MqttRTIambassador::registerObject(ObjectClassHandle theClass,
+                                                       std::wstring const& theObjectInstanceName,
+                                                       AttributeHandleSetRegionHandleSetPairVector const* regions)
+{
    ObjectInstance o;
+   std::string infoPayload;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
       auto pub = _publishedAttributes.find(theClassValue);
       if (pub == _publishedAttributes.end() || pub->second.empty())
          throw ObjectClassNotPublished(theClass.toString());
+      if (regions)
+      {
+         for (auto const& pair : *regions)
+            forEachAttribute(pair.first, [&](std::uint64_t av, AttributeHandle const& ah) {
+               if (!_fdd->classHasAttribute(theClassValue, av))
+                  throw AttributeNotDefined(ah.toString());
+               if (!pub->second.count(av))
+                  throw AttributeNotPublished(ah.toString());
+            });
+         checkRegionPairs(theClassValue, *regions);
+      }
       o.handle = newUniqueValue("O");
       if (!theObjectInstanceName.empty())
       {
@@ -871,22 +902,19 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstance(ObjectClassHandle
       o.owned = pub->second;
       if (Fdd::Attribute const* priv = _fdd->findAttribute(theClassValue, "HLAprivilegeToDeleteObject"))
          o.owned.insert(priv->handle);
+      if (regions)
+         for (auto const& pair : *regions)
+            forEachAttribute(pair.first, [&](std::uint64_t av, AttributeHandle const&) {
+               for (RegionHandle const& r : pair.second)
+                  o.updateRegions[av].insert(RegionHandleFriend::value(r));
+            });
       _objects[o.handle] = o;
+      infoPayload = objectInfo(o);
       evaluateAdvisories();
    }
-   Json info = Json::object();
-   info.set("instance", hex64(o.handle));
-   info.set("class", hex64(o.objectClass));
-   info.set("name", o.name);
-   info.set("owner", hex64(o.owner));
-   info.set("clientId", o.ownerClient);
-   Json owned = Json::array();
-   for (std::uint64_t a : o.owned)
-      owned.push(hex64(a));
-   info.set("owned", owned);
    try
    {
-      _transport->publish(o.topic + "/info", info.dump(), 1, true);
+      _transport->publish(o.topic + "/info", infoPayload, 1, true);
    }
    catch (std::runtime_error const& e)
    {

@@ -38,6 +38,9 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   en tête de fichier) ; `TimeValue.h` : temps comparables et bornes (ouvertes/fermées).
 - `src/rti1516e/MqttAdvisories.cpp` : callbacks d'avis à partir des abonnements publiés (`F/decl/<fédéré>`) ;
   commutateurs initialisés par les `<switches>` du FOM.
+- `src/rti1516e/MqttRegions.cpp` : DDM (régions, associations de mise à jour, abonnements avec régions,
+  10.28 à 10.30) ; abonnement effectif = union abonnement sans région / avec régions
+  (`recomputeSubscriptions`) ; régions de mise à jour publiées dans l'enregistrement `info`.
 - `src/rti1516e/Trace.cpp` : `HLA_MQTT_TRACE` (Windows), trace des exceptions HLA levées par la DLL.
 - `src/rti1516e/Fdd.*` : FDD fusionné, handles = FNV-1a 64 du nom qualifié ; `Xml.*`, `Json.h` : parseurs maison
   (pas de dépendance ajoutée).
@@ -54,6 +57,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/federation/` : `hla-federation-test` (broker requis), plusieurs ambassadors, FOM de test dans `foms/`.
 - `tests/objects/main.cpp` : `hla-objects-test` (broker requis), même FOM `foms/base.xml`.
 - `tests/time/main.cpp` : `hla-time-test` (broker requis), synchronisation et temps.
+- `tests/ddm/main.cpp` : `hla-ddm-test` (broker requis), services DDM 9.2 à 9.11 et 10.28 à 10.30.
 
 ## État au 2026-11-23
 - **Jalon 1 fait** : connect/disconnect, callbacks `HLA_EVOKED` et `HLA_IMMEDIATE`, `connectionLost`,
@@ -77,6 +81,9 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   TAR/TARA/NER/NERA/FQR, TSO, GALT/LITS, lookahead, livraison asynchrone). `hla-time-test` 43/43 en Release
   et Debug (+3 exécutions) ; tous les tests précédents verts ; broker propre. Boucles 2 fédérés :
   ~160 pas/s (TAR, lookahead 1), ~140 pas/s (NER, lookahead 0). Non faits : retract, change*OrderType.
+- **DDM, issues #21 à #24** (2026-11-24) : régions, bornes (10.28 à 10.30), enregistrement avec régions,
+  (dés)association, abonnements objets/interactions avec régions. `hla-ddm-test` 51/51 en Release, suite
+  complète verte. Pas encore de filtrage par recouvrement (un abonné avec régions reçoit tout).
 
 ## Essai VR-Link 5.4 (C:\MAKrlink5.4-netUtilitiesin64)
 - f18HLA1516e_64 + netdumpHLA1516e_64 fonctionnent sur notre RTI (découverte, 45 attributs RPR reçus),
@@ -112,6 +119,6 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 2. Compiler et tester l'encodage sous Linux/GCC.
 3. Tester la substitution de DLL sur un vrai fédéré dès qu'un exécutable est disponible.
 4. Option de build « version d'éditeur de liens PE » (compatibilité VR-Link), MIM standard (HLAmanager).
-5. Retract et change*OrderType, puis propriété, DDM, sauvegarde/restauration.
-6. CI Linux : débit ~40 messages/s et désordre sur la rafale de 1000 mises à jour (à reproduire sous Linux).
+5. Retract et change*OrderType, puis propriété, sauvegarde/restauration.
+6. DDM : envoi avec régions, filtrage par recouvrement et avis de portée (issues GitHub #25, #26, #27).
 5. Effacer la présence `offline` retained d'un client disparu (aujourd'hui elle reste sur le broker).

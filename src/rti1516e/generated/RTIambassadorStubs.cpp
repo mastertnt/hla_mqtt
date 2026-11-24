@@ -155,61 +155,6 @@ void MqttRTIambassador::changeInteractionOrderType(InteractionClassHandle theCla
    notImplemented(L"changeInteractionOrderType");
 }
 
-RegionHandle MqttRTIambassador::createRegion(DimensionHandleSet const & theDimensions)
-{
-   notImplemented(L"createRegion");
-}
-
-void MqttRTIambassador::commitRegionModifications(RegionHandleSet const & theRegionHandleSet)
-{
-   notImplemented(L"commitRegionModifications");
-}
-
-void MqttRTIambassador::deleteRegion(RegionHandle const & theRegion)
-{
-   notImplemented(L"deleteRegion");
-}
-
-ObjectInstanceHandle MqttRTIambassador::registerObjectInstanceWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector)
-{
-   notImplemented(L"registerObjectInstanceWithRegions");
-}
-
-ObjectInstanceHandle MqttRTIambassador::registerObjectInstanceWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector, std::wstring const & theObjectInstanceName)
-{
-   notImplemented(L"registerObjectInstanceWithRegions");
-}
-
-void MqttRTIambassador::associateRegionsForUpdates(ObjectInstanceHandle theObject, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector)
-{
-   notImplemented(L"associateRegionsForUpdates");
-}
-
-void MqttRTIambassador::unassociateRegionsForUpdates(ObjectInstanceHandle theObject, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector)
-{
-   notImplemented(L"unassociateRegionsForUpdates");
-}
-
-void MqttRTIambassador::subscribeObjectClassAttributesWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector, bool active, std::wstring const & updateRateDesignator)
-{
-   notImplemented(L"subscribeObjectClassAttributesWithRegions");
-}
-
-void MqttRTIambassador::unsubscribeObjectClassAttributesWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theAttributeHandleSetRegionHandleSetPairVector)
-{
-   notImplemented(L"unsubscribeObjectClassAttributesWithRegions");
-}
-
-void MqttRTIambassador::subscribeInteractionClassWithRegions(InteractionClassHandle theClass, RegionHandleSet const & theRegionHandleSet, bool active)
-{
-   notImplemented(L"subscribeInteractionClassWithRegions");
-}
-
-void MqttRTIambassador::unsubscribeInteractionClassWithRegions(InteractionClassHandle theClass, RegionHandleSet const & theRegionHandleSet)
-{
-   notImplemented(L"unsubscribeInteractionClassWithRegions");
-}
-
 void MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction, ParameterHandleValueMap const & theParameterValues, RegionHandleSet const & theRegionHandleSet, VariableLengthData const & theUserSuppliedTag)
 {
    notImplemented(L"sendInteractionWithRegions");
@@ -228,21 +173,6 @@ void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle
 double MqttRTIambassador::getUpdateRateValueForAttribute(ObjectInstanceHandle theObject, AttributeHandle theAttribute)
 {
    notImplemented(L"getUpdateRateValueForAttribute");
-}
-
-DimensionHandleSet MqttRTIambassador::getDimensionHandleSet(RegionHandle theRegionHandle)
-{
-   notImplemented(L"getDimensionHandleSet");
-}
-
-RangeBounds MqttRTIambassador::getRangeBounds(RegionHandle theRegionHandle, DimensionHandle theDimensionHandle)
-{
-   notImplemented(L"getRangeBounds");
-}
-
-void MqttRTIambassador::setRangeBounds(RegionHandle theRegionHandle, DimensionHandle theDimensionHandle, RangeBounds const & theRangeBounds)
-{
-   notImplemented(L"setRangeBounds");
 }
 
 }

@@ -42,6 +42,7 @@ tests/encoding/         hla-encoding-test : encodage et temps logiques, sans bro
 tests/federation/       hla-federation-test : plusieurs ambassadors, modules FOM de test (foms/)
 tests/objects/          hla-objects-test : publish/subscribe, objets, interactions entre fédérés
 tests/time/             hla-time-test : points de synchronisation, gestion du temps
+tests/ddm/              hla-ddm-test : régions, associations, abonnements avec régions
 tools/
   gen_rti_sources.py    régénère generated/ à partir des headers
   check_imports.py      compare les imports d'un fédéré aux exports de la DLL (Windows)
@@ -162,7 +163,7 @@ Tous les topics sont retained, sauf `sync`. `F` est le nom de la fédération, e
 | `<prefix>/federations/F/federates/<handle>` | `{"name","type","handle","clientId","state":"joining"/"joined"}` |
 | `<prefix>/federations/F/claims/<clientId>` | réservation transitoire du nom pendant une création |
 | `<prefix>/federations/F/names/<nom>/<clientId>` | réservation d'un nom d'instance `{"clientId","federate","state":"reserving"/"reserved"}` |
-| `<prefix>/federations/F/objects/<chemin de classe>/@<instance>/info` | enregistrement de l'instance `{"instance","class","name","owner","clientId"}` |
+| `<prefix>/federations/F/objects/<chemin de classe>/@<instance>/info` | enregistrement de l'instance `{"instance","class","name","owner","clientId","owned","regions"}` |
 | `.../@<instance>/update`, `.../@<instance>/delete` (non retained) | mise à jour d'attributs, suppression (binaire, `Wire.h`) |
 | `<prefix>/federations/F/interactions/<chemin de classe>/@` (non retained) | interaction (binaire) |
 | `<prefix>/federations/F/requests/<fédéré>`, `.../classrequests/<chemin>/@` (non retained) | requêtes de mise à jour d'attributs |
@@ -193,6 +194,7 @@ Seule une couverture minimale est abonnée (jamais une classe avec un de ses anc
 - **Variantes horodatées** acceptées et livrées en ordre de réception avec leur temps, puisqu'aucun fédéré ne peut encore être régulateur.
 - Les mises à jour et interactions partent sans attendre l'accusé du broker (QoS 1, ou QoS 0 si tous les attributs ou l'interaction sont `HLAbestEffort`) ; Paho conserve l'ordre.
 - **Avis** : chaque fédéré publie ses abonnements (`F/decl/<fédéré>`, retained). Chacun en déduit pour lui-même `start/stopRegistrationForObjectClass` (abonnement à la classe ou à une superclasse), `turnInteractionsOn/Off`, `turnUpdatesOn/OffForObjectInstance` (attributs possédés reçus par un abonné, à la classe sous laquelle il connaît l'objet) et `attributesInScope` à la découverte. Valeurs initiales des commutateurs : `<switches>` du FOM, désactivés sinon.
+- **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un objet voyagent dans son enregistrement `info`, en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction comme un abonnement sans région ; les deux coexistent. **Le filtrage par recouvrement n'est pas encore fait** : un abonné avec régions reçoit tout.
 
 ### Points de synchronisation
 
@@ -223,6 +225,7 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 
 `ctest` lance `--selftest`, `hla-encoding-test` (sans broker) et `hla-federation-test`, qui suppose un broker joignable (`--broker mqtt://hôte:1883` ou `HLA_MQTT_BROKER`). Ce dernier vérifie les erreurs de création et de join, les handles identiques entre fédérés, les modules additionnels, destroy avec un fédéré disparu, et des courses (4 créations ou 4 joins simultanés sous le même nom : un seul gagnant).
 `hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente.
+`hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, et 1000 mises à jour reçues dans l'ordre.
 
 Résultat attendu :
@@ -266,7 +269,8 @@ ctest --preset conan-release --output-on-failure
 ## Suite prévue
 
 - Retractions, changement d'ordre des attributs et interactions.
-- Gestion de la propriété, MOM (`HLAmanager`), DDM, sauvegarde/restauration.
+- Gestion de la propriété, MOM (`HLAmanager`), sauvegarde/restauration.
+- DDM : `sendInteractionWithRegions`, `requestAttributeValueUpdateWithRegions`, filtrage par recouvrement de régions et avis de portée (issues #25 et #26).
 - Présence `offline` (Last Will) d'un client disparu : reste retained sur le broker, rien ne l'efface.
 
 ---
