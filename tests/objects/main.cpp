@@ -516,6 +516,7 @@ int main(int argc, char** argv)
          v[position] = text(std::to_string(k));
          a.rti->updateAttributeValues(ford, v, text(""));
       }
+      double const sendSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       bool all = b.pump([&] { return int(b.reflections.size()) >= burst; }, 20.0);
       double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       int firstWrong = -1;
@@ -524,7 +525,8 @@ int main(int argc, char** argv)
             firstWrong = k;
       check(all && firstWrong < 0,
             std::to_string(burst) + " updates received in order (" + std::to_string(b.reflections.size()) +
-               " received in " + std::to_string(int(secs * 1000)) + " ms" +
+               " received in " + std::to_string(int(secs * 1000)) + " ms, sent in " +
+               std::to_string(int(sendSecs * 1000)) + " ms" +
                (firstWrong >= 0 ? ", order broken at " + std::to_string(firstWrong) : std::string()) + ")");
 
       // ---------------------------------------------------------- resign

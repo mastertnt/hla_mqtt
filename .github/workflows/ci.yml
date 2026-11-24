@@ -150,7 +150,8 @@ jobs:
 
       - name: Start Mosquitto
         run: |
-          docker run -d --name mosquitto -p 1883:1883 \
+          # Host network: no docker-proxy between the federates and the broker.
+          docker run -d --name mosquitto --network host \
             -v "$PWD/broker/mosquitto-hla.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2
           for i in $(seq 30); do
             if (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null; then echo "broker up"; exit 0; fi

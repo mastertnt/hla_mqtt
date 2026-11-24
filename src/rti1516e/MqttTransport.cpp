@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <future>
@@ -30,7 +31,9 @@ std::string presencePayload(char const* state, std::string const& clientId)
 struct MqttTransport::Impl
 {
    Impl(LocalSettings const& s)
-      : client(s.brokerUri, s.clientId, mqtt::create_options(MQTTVERSION_3_1_1))
+      // Paho C refuses a publication once maxBufferedMessages commands wait in
+      // its queue (default 100): a larger queue, and the sender retries anyway.
+      : client(s.brokerUri, s.clientId, mqtt::create_options(MQTTVERSION_3_1_1, 100000))
    {
    }
    mqtt::async_client client;
@@ -74,8 +77,7 @@ struct MqttTransport::Impl
          lock.unlock();
          try
          {
-            mqtt::delivery_token_ptr tok =
-               client.publish(o.topic, o.payload.data(), o.payload.size(), o.qos, o.retained);
+            mqtt::delivery_token_ptr tok = handOver(o);
             if (o.done)
                o.done->set_value(tok);
          }
@@ -83,11 +85,62 @@ struct MqttTransport::Impl
          {
             if (o.done)
                o.done->set_exception(std::current_exception());
+            else
+               reportDropped(o, std::current_exception());
          }
          lock.lock();
          sending = false;
          outCv.notify_all();
       }
+   }
+
+   // Hands one publication to Paho. A full Paho queue is back-pressure, not a
+   // failure: wait for it to drain instead of losing the message (losing one
+   // update silently breaks the order the receivers rely on).
+   mqtt::delivery_token_ptr handOver(Outgoing const& o)
+   {
+      auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      for (;;)
+      {
+         try
+         {
+            return client.publish(o.topic, o.payload.data(), o.payload.size(), o.qos, o.retained);
+         }
+         catch (mqtt::exception const& e)
+         {
+            if (e.get_return_code() != MQTTASYNC_MAX_BUFFERED_MESSAGES || !client.is_connected() ||
+                std::chrono::steady_clock::now() > deadline)
+               throw;
+            {
+               std::lock_guard<std::mutex> lock(outMutex);
+               if (stopSender)
+                  throw;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+         }
+      }
+   }
+
+   // A fire-and-forget publication that could not be handed to Paho: reported
+   // once on stderr, since its caller is gone.
+   std::atomic<std::uint64_t> dropped{0};
+   void reportDropped(Outgoing const& o, std::exception_ptr ep)
+   {
+      if (dropped++ != 0)
+         return;
+      std::string why = "unknown error";
+      try
+      {
+         std::rethrow_exception(ep);
+      }
+      catch (std::exception const& e)
+      {
+         why = e.what();
+      }
+      catch (...)
+      {
+      }
+      std::fprintf(stderr, "[hla-mqtt-rti] publication on %s lost: %s\n", o.topic.c_str(), why.c_str());
    }
 
    void enqueue(Outgoing o)
