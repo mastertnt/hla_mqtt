@@ -60,7 +60,8 @@ enum class WireKind : unsigned char
    Update = 1,
    Interaction = 2,
    Delete = 3,
-   Request = 4
+   Request = 4,
+   Retract = 5 // sender, seq, retraction handle (8.21)
 };
 
 unsigned char const kWireVersion = 1;

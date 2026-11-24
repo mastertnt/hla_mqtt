@@ -65,26 +65,6 @@ void MqttRTIambassador::queryFederationRestoreStatus()
    notImplemented(L"queryFederationRestoreStatus");
 }
 
-void MqttRTIambassador::requestAttributeTransportationTypeChange(ObjectInstanceHandle theObject, AttributeHandleSet const & theAttributes, TransportationType theType)
-{
-   notImplemented(L"requestAttributeTransportationTypeChange");
-}
-
-void MqttRTIambassador::queryAttributeTransportationType(ObjectInstanceHandle theObject, AttributeHandle theAttribute)
-{
-   notImplemented(L"queryAttributeTransportationType");
-}
-
-void MqttRTIambassador::requestInteractionTransportationTypeChange(InteractionClassHandle theClass, TransportationType theType)
-{
-   notImplemented(L"requestInteractionTransportationTypeChange");
-}
-
-void MqttRTIambassador::queryInteractionTransportationType(FederateHandle theFederate, InteractionClassHandle theInteraction)
-{
-   notImplemented(L"queryInteractionTransportationType");
-}
-
 void MqttRTIambassador::unconditionalAttributeOwnershipDivestiture(ObjectInstanceHandle theObject, AttributeHandleSet const & theAttributes)
 {
    notImplemented(L"unconditionalAttributeOwnershipDivestiture");
@@ -140,21 +120,6 @@ bool MqttRTIambassador::isAttributeOwnedByFederate(ObjectInstanceHandle theObjec
    notImplemented(L"isAttributeOwnedByFederate");
 }
 
-void MqttRTIambassador::retract(MessageRetractionHandle theHandle)
-{
-   notImplemented(L"retract");
-}
-
-void MqttRTIambassador::changeAttributeOrderType(ObjectInstanceHandle theObject, AttributeHandleSet const & theAttributes, OrderType theType)
-{
-   notImplemented(L"changeAttributeOrderType");
-}
-
-void MqttRTIambassador::changeInteractionOrderType(InteractionClassHandle theClass, OrderType theType)
-{
-   notImplemented(L"changeInteractionOrderType");
-}
-
 void MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInteraction, ParameterHandleValueMap const & theParameterValues, RegionHandleSet const & theRegionHandleSet, VariableLengthData const & theUserSuppliedTag)
 {
    notImplemented(L"sendInteractionWithRegions");
@@ -168,11 +133,6 @@ MessageRetractionHandle MqttRTIambassador::sendInteractionWithRegions(Interactio
 void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle theClass, AttributeHandleSetRegionHandleSetPairVector const & theSet, VariableLengthData const & theUserSuppliedTag)
 {
    notImplemented(L"requestAttributeValueUpdateWithRegions");
-}
-
-double MqttRTIambassador::getUpdateRateValueForAttribute(ObjectInstanceHandle theObject, AttributeHandle theAttribute)
-{
-   notImplemented(L"getUpdateRateValueForAttribute");
 }
 
 }

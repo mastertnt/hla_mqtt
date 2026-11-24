@@ -39,6 +39,8 @@
 
 #include "MqttRTIambassador.h"
 
+#include "HandleFriends.h"
+
 #include "Json.h"
 #include "MqttTransport.h"
 #include "Utf.h"
@@ -77,6 +79,9 @@ void MqttRTIambassador::resetTime()
    _time.requested = TimeValue::zero(isInt);
    _tsoQueue.clear();
    _roHeld.clear();
+   _sentTso.clear();
+   _deliveredTso.clear();
+   _deliveredTsoOrder.clear();
 }
 
 TimeValue MqttRTIambassador::queueMin() const
@@ -329,7 +334,8 @@ void MqttRTIambassador::evaluateTime()
             // TSO messages up to the grant time (all of them for a flush).
             while (!_tsoQueue.empty() && (a == Advance::FQR || _tsoQueue.begin()->first <= next))
             {
-               TimedCallback cb = _tsoQueue.begin()->second;
+               TimedCallback cb = _tsoQueue.begin()->second.cb;
+               tsoDelivered(_tsoQueue.begin()->second.retraction);
                _tsoQueue.erase(_tsoQueue.begin());
                enqueue([cb](FederateAmbassador& fa) { cb(fa, TIMESTAMP); });
             }
@@ -428,11 +434,11 @@ void MqttRTIambassador::deliverRO(Callback cb)
       enqueue(std::move(cb));
 }
 
-void MqttRTIambassador::deliverTimed(TimeValue const& ts, bool tso, TimedCallback cb)
+void MqttRTIambassador::deliverTimed(TimeValue const& ts, bool tso, TimedCallback cb, std::uint64_t retraction)
 {
    if (tso && _time.constrained)
    {
-      _tsoQueue.emplace(ts, std::move(cb));
+      _tsoQueue.emplace(ts, QueuedTso{retraction, std::move(cb)});
       evaluateTime();
    }
    else
@@ -447,6 +453,79 @@ bool MqttRTIambassador::sendsTso(bool timestampOrder, TimeValue const& ts)
    if (b.open ? !(ts > b.value) : ts < b.value)
       throw InvalidLogicalTime(L"timestamp below the logical time plus lookahead (or the requested time while advancing)");
    return true;
+}
+
+// ======================================================== 8.21 retract
+// The sender keeps the TSO messages it may still retract (timestamp beyond its
+// logical time) and publishes a Retract message on the topic of the original:
+// same sender, same topic, so the broker delivers it after the original. A
+// receiver drops the message from its TSO queue, or calls requestRetraction
+// (8.22) if the message was already delivered TSO. Only TSO messages are
+// retractable; the RO part of an update and deletions are not.
+void MqttRTIambassador::rememberSentTso(std::uint64_t retraction, TimeValue const& ts, std::string const& topic)
+{
+   if (_sentTso.size() > 4096)
+      for (auto it = _sentTso.begin(); it != _sentTso.end();)
+         it = it->second.time <= _time.time ? _sentTso.erase(it) : std::next(it);
+   _sentTso[retraction] = SentTso{ts, topic};
+}
+
+void MqttRTIambassador::tsoDelivered(std::uint64_t retraction)
+{
+   if (retraction == 0 || !_deliveredTso.insert(retraction).second)
+      return;
+   _deliveredTsoOrder.push_back(retraction);
+   if (_deliveredTsoOrder.size() > 4096)
+   {
+      _deliveredTso.erase(_deliveredTsoOrder.front());
+      _deliveredTsoOrder.pop_front();
+   }
+}
+
+void MqttRTIambassador::handleRetraction(std::uint64_t retraction)
+{
+   for (auto it = _tsoQueue.begin(); it != _tsoQueue.end(); ++it)
+      if (it->second.retraction == retraction)
+      {
+         _tsoQueue.erase(it);
+         evaluateTime(); // the queue minimum may have changed
+         return;
+      }
+   if (_deliveredTso.count(retraction))
+   {
+      MessageRetractionHandle const h = MessageRetractionHandleFriend::create(retraction);
+      enqueue([h](FederateAmbassador& fa) { fa.requestRetraction(h); });
+   }
+}
+
+void MqttRTIambassador::retract(MessageRetractionHandle theHandle)
+{
+   std::lock_guard<std::mutex> lock(_stateMutex);
+   checkJoined();
+   std::lock_guard<std::mutex> v(_viewMutex);
+   if (!_time.regulating)
+      throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");
+   std::uint64_t const h = MessageRetractionHandleFriend::value(theHandle);
+   auto it = _sentTso.find(h);
+   if (h == 0 || it == _sentTso.end())
+      throw InvalidMessageRetractionHandle(theHandle.toString());
+   if (it->second.time <= _time.time)
+   {
+      _sentTso.erase(it);
+      throw MessageCanNoLongerBeRetracted(theHandle.toString() + L": its timestamp is not beyond the logical time");
+   }
+   WireWriter w(WireKind::Retract);
+   w.u64(_federateHandle).u64(nextSeq()).u64(h);
+   std::string const topic = it->second.topic;
+   _sentTso.erase(it);
+   try
+   {
+      _transport->publishAsync(topic, w.str(), 1, false);
+   }
+   catch (std::runtime_error const& e)
+   {
+      throw RTIinternalError(fromUtf8(e.what()));
+   }
 }
 
 // ======================================================== 8 services
@@ -536,7 +615,7 @@ void MqttRTIambassador::disableTimeConstrained()
    // Queued TSO messages and held RO messages are delivered now (RO).
    for (auto& kv : _tsoQueue)
    {
-      TimedCallback cb = kv.second;
+      TimedCallback cb = kv.second.cb;
       enqueue([cb](FederateAmbassador& fa) { cb(fa, RECEIVE); });
    }
    _tsoQueue.clear();

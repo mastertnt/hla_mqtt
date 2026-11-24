@@ -195,6 +195,7 @@ Seule une couverture minimale est abonnée (jamais une classe avec un de ses anc
 - Les mises à jour et interactions partent sans attendre l'accusé du broker (QoS 1, ou QoS 0 si tous les attributs ou l'interaction sont `HLAbestEffort`) ; Paho conserve l'ordre.
 - **Avis** : chaque fédéré publie ses abonnements (`F/decl/<fédéré>`, retained). Chacun en déduit pour lui-même `start/stopRegistrationForObjectClass` (abonnement à la classe ou à une superclasse), `turnInteractionsOn/Off`, `turnUpdatesOn/OffForObjectInstance` (attributs possédés reçus par un abonné, à la classe sous laquelle il connaît l'objet) et `attributesInScope` à la découverte. Valeurs initiales des commutateurs : `<switches>` du FOM, désactivés sinon.
 - **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un objet voyagent dans son enregistrement `info`, en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction comme un abonnement sans région ; les deux coexistent. **Le filtrage par recouvrement n'est pas encore fait** : un abonné avec régions reçoit tout.
+- **Ordre et transport choisis par l'émetteur** : `changeAttributeOrderType` / `changeInteractionOrderType` et `request*TransportationTypeChange` ne valent que pour les messages du fédéré qui les demande (confirmation par callback, immédiate). Les autres l'apprennent par les enregistrements retained : `"transport"` dans l'enregistrement `info` de l'objet, `"it"` dans `F/decl/<fédéré>` pour les interactions ; les réflexions et interactions reçues portent ce transport, et `query*TransportationType` le rapporte. `getUpdateRateValueForAttribute` rend le taux du désignateur utilisé à l'abonnement (0 sans désignateur).
 
 ### Points de synchronisation
 
@@ -208,7 +209,7 @@ Le label est réservé comme un nom de fédération (réservation + barrière). 
 - Activer la régulation ou la contrainte attend un aller-retour vers le broker après la publication de l'état en attente ; le temps d'un nouveau régulateur est relevé au plus grand temps des fédérés contraints.
 - Messages TSO livrés avant le grant, dans l'ordre des estampilles ; messages RO retenus pour un fédéré contraint hors avance, sauf livraison asynchrone.
 - Pendant une avance, un régulateur ne peut envoyer en TSO qu'au-delà de son prochain temps + lookahead (plus strict que la norme, nécessaire à la règle de coupe).
-- Non encore faits : `retract`, `changeAttributeOrderType`, `changeInteractionOrderType`.
+- **Retract** : l'émetteur garde ses messages TSO dont l'horodatage dépasse encore son temps logique ; `retract` publie un message `Retract` sur le topic de l'original (même émetteur, même topic : le broker le livre après). Le récepteur retire le message de sa file TSO, ou appelle `requestRetraction` s'il l'a déjà livré TSO. Seuls les messages envoyés TSO sont rétractables (ni la partie RO d'une mise à jour, ni les suppressions).
 
 ## Client de test
 
@@ -224,9 +225,9 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 ```
 
 `ctest` lance `--selftest`, `hla-encoding-test` (sans broker) et `hla-federation-test`, qui suppose un broker joignable (`--broker mqtt://hôte:1883` ou `HLA_MQTT_BROKER`). Ce dernier vérifie les erreurs de création et de join, les handles identiques entre fédérés, les modules additionnels, destroy avec un fédéré disparu, et des courses (4 créations ou 4 joins simultanés sous le même nom : un seul gagnant).
-`hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente.
+`hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente, `retract` (avant et après livraison, trop tard) et changement d'ordre des attributs et interactions.
 `hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région.
-`hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, et 1000 mises à jour reçues dans l'ordre.
+`hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
 Résultat attendu :
 
@@ -268,7 +269,6 @@ ctest --preset conan-release --output-on-failure
 
 ## Suite prévue
 
-- Retractions, changement d'ordre des attributs et interactions.
 - Gestion de la propriété, MOM (`HLAmanager`), sauvegarde/restauration.
 - DDM : `sendInteractionWithRegions`, `requestAttributeValueUpdateWithRegions`, filtrage par recouvrement de régions et avis de portée (issues #25 et #26).
 - Présence `offline` (Last Will) d'un client disparu : reste retained sur le broker, rien ne l'efface.

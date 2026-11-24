@@ -107,6 +107,7 @@ struct Reflection
    std::string tag;
    bool hasTime = false;
    double time = 0;
+   TransportationType tt = RELIABLE;
 };
 
 struct Received
@@ -116,6 +117,7 @@ struct Received
    std::string tag;
    bool hasTime = false;
    double time = 0;
+   TransportationType tt = RELIABLE;
 };
 
 struct Federate : NullFederateAmbassador
@@ -132,6 +134,8 @@ struct Federate : NullFederateAmbassador
    std::vector<std::string> advisories;
    std::set<AttributeHandle> updatesOn, inScope;
    std::set<std::wstring> multipleSucceeded, multipleFailed;
+   // transportation: "confirm-a:<n>:<tt>", "report-a:<tt>", "confirm-i:<tt>", "report-i:<tt>"
+   std::vector<std::string> transports;
 
    explicit Federate(std::string const& clientId)
    {
@@ -160,10 +164,11 @@ struct Federate : NullFederateAmbassador
       ++discoverCount;
    }
    void reflectAttributeValues(ObjectInstanceHandle o, AttributeHandleValueMap const& v, VariableLengthData const& tag,
-                               OrderType, TransportationType, SupplementalReflectInfo)
+                               OrderType, TransportationType tt, SupplementalReflectInfo)
       RTI_THROW((FederateInternalError)) override
    {
       reflections.push_back(Reflection{o, v, str(tag)});
+      reflections.back().tt = tt;
    }
    void reflectAttributeValues(ObjectInstanceHandle o, AttributeHandleValueMap const& v, VariableLengthData const& tag,
                                OrderType, TransportationType, LogicalTime const& t, OrderType, SupplementalReflectInfo)
@@ -172,10 +177,32 @@ struct Federate : NullFederateAmbassador
       reflections.push_back(Reflection{o, v, str(tag), true, dynamic_cast<HLAfloat64Time const&>(t).getTime()});
    }
    void receiveInteraction(InteractionClassHandle c, ParameterHandleValueMap const& v, VariableLengthData const& tag,
-                           OrderType, TransportationType, SupplementalReceiveInfo)
+                           OrderType, TransportationType tt, SupplementalReceiveInfo)
       RTI_THROW((FederateInternalError)) override
    {
       interactions.push_back(Received{c, v, str(tag)});
+      interactions.back().tt = tt;
+   }
+   static std::string ttName(TransportationType t) { return t == BEST_EFFORT ? "BE" : "R"; }
+   void confirmAttributeTransportationTypeChange(ObjectInstanceHandle, AttributeHandleSet a, TransportationType t)
+      RTI_THROW((FederateInternalError)) override
+   {
+      transports.push_back("confirm-a:" + std::to_string(a.size()) + ":" + ttName(t));
+   }
+   void reportAttributeTransportationType(ObjectInstanceHandle, AttributeHandle, TransportationType t)
+      RTI_THROW((FederateInternalError)) override
+   {
+      transports.push_back("report-a:" + ttName(t));
+   }
+   void confirmInteractionTransportationTypeChange(InteractionClassHandle, TransportationType t)
+      RTI_THROW((FederateInternalError)) override
+   {
+      transports.push_back("confirm-i:" + ttName(t));
+   }
+   void reportInteractionTransportationType(FederateHandle, InteractionClassHandle, TransportationType t)
+      RTI_THROW((FederateInternalError)) override
+   {
+      transports.push_back("report-i:" + ttName(t));
    }
    void receiveInteraction(InteractionClassHandle c, ParameterHandleValueMap const& v, VariableLengthData const& tag,
                            OrderType, TransportationType, LogicalTime const& t, OrderType, SupplementalReceiveInfo)
@@ -253,6 +280,89 @@ bool has(std::vector<std::string> const& v, std::string const& x)
    return false;
 }
 
+// 6.23 to 6.30 transportation type changes and queries, 10.14 update rate.
+void transportTests(std::string const& run)
+{
+   std::wstring const fed = widen("tttest-" + run);
+   Federate x("tt-x-" + run), y("tt-y-" + run);
+   x.rti->createFederationExecution(fed, fom("base.xml"));
+   FederateHandle const xh = x.rti->joinFederationExecution(L"x", L"t", fed);
+   FederateHandle const yh = y.rti->joinFederationExecution(L"y", L"t", fed);
+   ObjectClassHandle const vehicle = x.rti->getObjectClassHandle(L"Vehicle");
+   ObjectClassHandle const car = x.rti->getObjectClassHandle(L"Vehicle.Car");
+   AttributeHandle const position = x.rti->getAttributeHandle(vehicle, L"Position"); // HLAreliable
+   AttributeHandle const name = x.rti->getAttributeHandle(vehicle, L"Name");         // HLAbestEffort
+   AttributeHandle const speed = x.rti->getAttributeHandle(car, L"Speed");
+   InteractionClassHandle const message = x.rti->getInteractionClassHandle(L"Message"); // HLAreliable
+   InteractionClassHandle const root = x.rti->getInteractionClassHandle(L"HLAinteractionRoot");
+   x.rti->publishObjectClassAttributes(vehicle, AttributeHandleSet{position, name});
+   x.rti->publishInteractionClass(message);
+   y.rti->subscribeObjectClassAttributes(vehicle, AttributeHandleSet{position, name}, true, L"Fast");
+   y.rti->subscribeInteractionClass(message);
+   ObjectInstanceHandle const obj = x.rti->registerObjectInstance(vehicle);
+   check(y.pump([&] { return y.discovered.count(obj) != 0; }), "transport: Y discovers X's object");
+
+   // ------------------------------------------------- 10.14 update rate
+   check(y.rti->getUpdateRateValueForAttribute(obj, position) == 10.0,
+         "getUpdateRateValueForAttribute = rate of the designator used to subscribe (Fast = 10)");
+   check(x.rti->getUpdateRateValueForAttribute(obj, position) == 0.0, "getUpdateRateValueForAttribute for the owner = 0");
+   expect<AttributeNotDefined>("getUpdateRateValueForAttribute, attribute of a subclass -> AttributeNotDefined",
+                               [&] { y.rti->getUpdateRateValueForAttribute(obj, speed); });
+   expect<ObjectInstanceNotKnown>("getUpdateRateValueForAttribute, unknown object -> ObjectInstanceNotKnown",
+                                  [&] { y.rti->getUpdateRateValueForAttribute(ObjectInstanceHandle(), position); });
+
+   // ---------------------------------- 6.23 to 6.26 attribute transportation
+   auto last = [](Federate& f) { return f.transports.empty() ? std::string() : f.transports.back(); };
+   y.rti->queryAttributeTransportationType(obj, name);
+   check(y.pump([&] { return last(y) == "report-a:BE"; }), "queryAttributeTransportationType: FDD value (Name best effort)");
+   expect<AttributeNotOwned>("requestAttributeTransportationTypeChange by a non-owner -> AttributeNotOwned",
+                             [&] { y.rti->requestAttributeTransportationTypeChange(obj, AttributeHandleSet{position}, BEST_EFFORT); });
+   expect<InvalidTransportationType>("requestAttributeTransportationTypeChange, invalid type -> InvalidTransportationType",
+                                     [&] { x.rti->requestAttributeTransportationTypeChange(obj, AttributeHandleSet{position}, TransportationType(7)); });
+   expect<AttributeNotDefined>("requestAttributeTransportationTypeChange, undefined attribute -> AttributeNotDefined",
+                               [&] { x.rti->requestAttributeTransportationTypeChange(obj, AttributeHandleSet{speed}, BEST_EFFORT); });
+   x.rti->requestAttributeTransportationTypeChange(obj, AttributeHandleSet{position}, BEST_EFFORT);
+   check(x.pump([&] { return last(x) == "confirm-a:1:BE"; }), "confirmAttributeTransportationTypeChange");
+   x.rti->queryAttributeTransportationType(obj, position);
+   check(x.pump([&] { return last(x) == "report-a:BE"; }), "owner's query sees the change");
+   bool seen = y.pump([&] {
+      y.rti->queryAttributeTransportationType(obj, position);
+      y.settle(0.05);
+      return last(y) == "report-a:BE";
+   });
+   check(seen, "another federate's query sees the change (info record)");
+   y.reflections.clear();
+   AttributeHandleValueMap v;
+   v[position] = text("p");
+   x.rti->updateAttributeValues(obj, v, text(""));
+   check(y.pump([&] { return !y.reflections.empty(); }) && y.reflections[0].tt == BEST_EFFORT,
+         "reflection reports the changed transportation (BEST_EFFORT)");
+
+   // --------------------------------- 6.27 to 6.30 interaction transportation
+   expect<InteractionClassNotPublished>("requestInteractionTransportationTypeChange, not published -> InteractionClassNotPublished",
+                                        [&] { x.rti->requestInteractionTransportationTypeChange(root, BEST_EFFORT); });
+   y.rti->queryInteractionTransportationType(xh, message);
+   check(y.pump([&] { return last(y) == "report-i:R"; }), "queryInteractionTransportationType: FDD value (reliable)");
+   x.rti->requestInteractionTransportationTypeChange(message, BEST_EFFORT);
+   check(x.pump([&] { return last(x) == "confirm-i:BE"; }), "confirmInteractionTransportationTypeChange");
+   seen = y.pump([&] {
+      y.rti->queryInteractionTransportationType(xh, message);
+      y.settle(0.05);
+      return last(y) == "report-i:BE";
+   });
+   check(seen, "another federate's query sees X's change (declarations record)");
+   x.rti->queryInteractionTransportationType(yh, message);
+   check(x.pump([&] { return last(x) == "report-i:R"; }), "a change applies only to the federate that made it");
+   y.interactions.clear();
+   x.rti->sendInteraction(message, ParameterHandleValueMap(), text(""));
+   check(y.pump([&] { return !y.interactions.empty(); }) && y.interactions[0].tt == BEST_EFFORT,
+         "received interaction reports the sender's transportation (BEST_EFFORT)");
+
+   x.rti->resignFederationExecution(DELETE_OBJECTS);
+   y.rti->resignFederationExecution(NO_ACTION);
+   x.rti->destroyFederationExecution(fed);
+}
+
 // Advisory callbacks between a publisher X and a subscriber Y.
 void advisoryTests(std::string const& run)
 {
@@ -325,6 +435,7 @@ int main(int argc, char** argv)
    try
    {
       advisoryTests(run);
+      transportTests(run);
       Federate a("objtest-a-" + run), b("objtest-b-" + run), c("objtest-c-" + run);
       a.rti->createFederationExecution(fed, fom("base.xml"));
       a.rti->joinFederationExecution(L"producer", L"t", fed);

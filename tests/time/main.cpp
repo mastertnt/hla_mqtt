@@ -117,6 +117,7 @@ struct Federate : NullFederateAmbassador
    std::int64_t regulationEnabled = -1, constrainedEnabled = -1;
    std::vector<std::int64_t> grants;
    std::vector<Event> events;
+   std::vector<MessageRetractionHandle> retractions;
 
    explicit Federate(std::string const& clientId)
    {
@@ -196,11 +197,31 @@ struct Federate : NullFederateAmbassador
    {
       events.push_back(Event{"u:" + str(tag), itime(t), received});
    }
+   void reflectAttributeValues(ObjectInstanceHandle, AttributeHandleValueMap const&, VariableLengthData const& tag,
+                               OrderType, TransportationType, LogicalTime const& t, OrderType received,
+                               SupplementalReflectInfo) RTI_THROW((FederateInternalError)) override
+   {
+      events.push_back(Event{"u:" + str(tag), itime(t), received});
+   }
    void discoverObjectInstance(ObjectInstanceHandle, ObjectClassHandle, std::wstring const&)
       RTI_THROW((FederateInternalError)) override
    {
+      ++discovered;
    }
+   void requestRetraction(MessageRetractionHandle h) RTI_THROW((FederateInternalError)) override
+   {
+      retractions.push_back(h);
+   }
+   int discovered = 0;
 };
+
+bool hasEvent(std::vector<Event> const& events, std::string const& what)
+{
+   for (Event const& e : events)
+      if (e.what == what)
+         return true;
+   return false;
+}
 
 void syncTests(std::string const& run)
 {
@@ -403,6 +424,104 @@ void timeTests(std::string const& run)
    a.rti->destroyFederationExecution(fed);
 }
 
+// 8.21 retract, 8.22 requestRetraction, 8.23 and 8.24 order type changes.
+void retractTests(std::string const& run)
+{
+   std::wstring const fed = widen("retracttest-" + run);
+   Federate a("retract-a-" + run), b("retract-b-" + run);
+   a.rti->createFederationExecution(fed, fom("base.xml"), L"HLAinteger64Time");
+   a.rti->joinFederationExecution(L"a", L"t", fed);
+   b.rti->joinFederationExecution(L"b", L"t", fed);
+   InteractionClassHandle const urgent = a.rti->getInteractionClassHandle(L"Message.Urgent"); // TimeStamp
+   InteractionClassHandle const message = a.rti->getInteractionClassHandle(L"Message");       // Receive
+   InteractionClassHandle const root = a.rti->getInteractionClassHandle(L"HLAinteractionRoot");
+   ObjectClassHandle const vehicle = a.rti->getObjectClassHandle(L"Vehicle");
+   AttributeHandle const position = a.rti->getAttributeHandle(vehicle, L"Position"); // TimeStamp
+   a.rti->publishInteractionClass(urgent);
+   a.rti->publishInteractionClass(message);
+   a.rti->publishObjectClassAttributes(vehicle, AttributeHandleSet{position});
+   b.rti->subscribeInteractionClass(message);
+   b.rti->subscribeObjectClassAttributes(vehicle, AttributeHandleSet{position}, true, L"");
+   ObjectInstanceHandle const obj = a.rti->registerObjectInstance(vehicle);
+   ParameterHandleValueMap const none;
+
+   expect<TimeRegulationIsNotEnabled>("retract while not regulating -> TimeRegulationIsNotEnabled",
+                                      [&] { a.rti->retract(MessageRetractionHandle()); });
+   b.rti->enableTimeConstrained();
+   check(b.pump([&] { return b.constrainedEnabled >= 0; }), "retract: B constrained");
+   a.rti->enableTimeRegulation(HLAinteger64Interval(10));
+   check(a.pump([&] { return a.regulationEnabled >= 0; }), "retract: A regulating, lookahead 10");
+
+   // Retracted before delivery: B never sees it.
+   MessageRetractionHandle const h1 = a.rti->sendInteraction(urgent, none, text("r1"), HLAinteger64Time(15));
+   bool ok = true;
+   try
+   {
+      a.rti->retract(h1);
+   }
+   catch (Exception const& e)
+   {
+      ok = false;
+      std::cout << narrow(e.what()) << std::endl;
+   }
+   check(ok, "retract a queued TSO message");
+   expect<InvalidMessageRetractionHandle>("retract twice -> InvalidMessageRetractionHandle", [&] { a.rti->retract(h1); });
+   expect<InvalidMessageRetractionHandle>("retract an invalid handle -> InvalidMessageRetractionHandle",
+                                          [&] { a.rti->retract(MessageRetractionHandle()); });
+   MessageRetractionHandle const hro = a.rti->sendInteraction(message, none, text("ro"), HLAinteger64Time(16));
+   expect<InvalidMessageRetractionHandle>("retract a message sent RO -> InvalidMessageRetractionHandle",
+                                          [&] { a.rti->retract(hro); });
+
+   // Delivered, then retracted: requestRetraction at B.
+   MessageRetractionHandle const h2 = a.rti->sendInteraction(urgent, none, text("r2"), HLAinteger64Time(12));
+   a.rti->timeAdvanceRequest(HLAinteger64Time(5));
+   check(a.pump([&] { return a.lastGrant() == 5; }), "retract: A granted 5");
+   b.rti->timeAdvanceRequest(HLAinteger64Time(13));
+   check(b.pump([&] { return b.lastGrant() == 13; }), "retract: B granted 13 (GALT 15)");
+   check(hasEvent(b.events, "i:r2") && !hasEvent(b.events, "i:r1"),
+         "the retracted message is not delivered, the other TSO message is");
+   a.rti->retract(h2);
+   check(b.pump([&] { return !b.retractions.empty(); }) && b.retractions.size() == 1 && b.retractions[0] == h2,
+         "retract after delivery -> requestRetraction at the receiver");
+
+   // Too late: the sender's time has passed the timestamp.
+   MessageRetractionHandle const h3 = a.rti->sendInteraction(urgent, none, text("r3"), HLAinteger64Time(20));
+   a.rti->timeAdvanceRequest(HLAinteger64Time(25));
+   check(a.pump([&] { return a.lastGrant() == 25; }), "retract: A granted 25");
+   expect<MessageCanNoLongerBeRetracted>("retract below the logical time -> MessageCanNoLongerBeRetracted",
+                                         [&] { a.rti->retract(h3); });
+
+   // 8.24 changeInteractionOrderType: Urgent sent RO.
+   b.rti->enableAsynchronousDelivery();
+   expect<InteractionClassNotPublished>("changeInteractionOrderType, not published -> InteractionClassNotPublished",
+                                        [&] { a.rti->changeInteractionOrderType(root, RECEIVE); });
+   expect<InteractionClassNotDefined>("changeInteractionOrderType, invalid class -> InteractionClassNotDefined",
+                                      [&] { a.rti->changeInteractionOrderType(InteractionClassHandle(), RECEIVE); });
+   a.rti->changeInteractionOrderType(urgent, RECEIVE);
+   a.rti->sendInteraction(urgent, none, text("o1"), HLAinteger64Time(50));
+   bool got = b.pump([&] { return hasEvent(b.events, "i:o1"); });
+   check(got && b.events.back().received == RECEIVE && b.lastGrant() == 13,
+         "changeInteractionOrderType(RECEIVE): TimeStamp interaction delivered RO, before B's time reaches it");
+
+   // 8.23 changeAttributeOrderType: Position sent RO.
+   check(b.pump([&] { return b.discovered > 0; }), "retract: B discovers A's object");
+   expect<ObjectInstanceNotKnown>("changeAttributeOrderType, unknown object -> ObjectInstanceNotKnown",
+                                  [&] { a.rti->changeAttributeOrderType(ObjectInstanceHandle(), AttributeHandleSet{position}, RECEIVE); });
+   expect<AttributeNotOwned>("changeAttributeOrderType by a non-owner -> AttributeNotOwned",
+                             [&] { b.rti->changeAttributeOrderType(obj, AttributeHandleSet{position}, RECEIVE); });
+   a.rti->changeAttributeOrderType(obj, AttributeHandleSet{position}, RECEIVE);
+   AttributeHandleValueMap pos;
+   pos[position] = text("p");
+   a.rti->updateAttributeValues(obj, pos, text("p50"), HLAinteger64Time(50));
+   got = b.pump([&] { return hasEvent(b.events, "u:p50"); });
+   check(got && b.events.back().received == RECEIVE && b.lastGrant() == 13,
+         "changeAttributeOrderType(RECEIVE): TimeStamp attribute reflected RO");
+
+   a.rti->resignFederationExecution(DELETE_OBJECTS);
+   b.rti->resignFederationExecution(NO_ACTION);
+   a.rti->destroyFederationExecution(fed);
+}
+
 // Two federates, both regulating and constrained, exchanging TSO messages.
 void loopTest(std::string const& run, std::int64_t lookahead, bool useNer, int steps)
 {
@@ -505,6 +624,7 @@ int main(int argc, char** argv)
    {
       syncTests(run);
       timeTests(run);
+      retractTests(run);
       loopTest(run, 1, false, 50);
       loopTest(run, 0, true, 50);
    }

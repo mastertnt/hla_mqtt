@@ -49,11 +49,16 @@ std::string MqttRTIambassador::declarationsPayload() const
    Json i = Json::array();
    for (std::uint64_t c : _subscribedInteractions)
       i.push(hex64(c));
-   if (o.members().empty() && i.items().empty())
+   Json it = Json::object(); // 6.27 transportation changes, needed by queries and receivers
+   for (auto const& kv : _interactionTransport)
+      it.set(hex64(kv.first), kv.second);
+   if (o.members().empty() && i.items().empty() && it.members().empty())
       return std::string();
    Json j = Json::object();
    j.set("o", o);
    j.set("i", i);
+   if (!it.members().empty())
+      j.set("it", it);
    return j.dump();
 }
 
@@ -95,6 +100,8 @@ void MqttRTIambassador::handleDeclarations(std::string const& hexHandle, std::st
          }
          for (std::string const& c : j["i"].strings())
             d.interactions.insert(parseHex(c));
+         for (auto const& kv : j["it"].members())
+            d.interactionTransport[parseHex(kv.first)] = kv.second.str();
          _remoteDecl[h] = d;
       }
       catch (std::exception const&)

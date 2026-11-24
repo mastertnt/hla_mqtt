@@ -52,6 +52,13 @@ void MqttRTIambassador::recomputeSubscriptions()
       for (auto const& attr : cls.second)
          if (!attr.second.empty())
             _subscribedAttributes[cls.first].insert(attr.first);
+   for (auto c = _subscribedRates.begin(); c != _subscribedRates.end();) // rates of subscribed attributes only
+   {
+      auto sub = _subscribedAttributes.find(c->first);
+      for (auto a = c->second.begin(); a != c->second.end();)
+         a = sub != _subscribedAttributes.end() && sub->second.count(a->first) ? std::next(a) : c->second.erase(a);
+      c = c->second.empty() ? _subscribedRates.erase(c) : std::next(c);
+   }
    _subscribedInteractions = _plainSubscribedInteractions;
    for (auto const& kv : _regionSubscribedInteractions)
       if (!kv.second.empty())
@@ -131,6 +138,11 @@ std::string MqttRTIambassador::objectInfo(ObjectInstance const& o) const
    for (std::uint64_t a : o.owned)
       owned.push(hex64(a));
    info.set("owned", owned);
+   Json transport = Json::object();
+   for (auto const& kv : o.transport)
+      transport.set(hex64(kv.first), kv.second);
+   if (!transport.members().empty())
+      info.set("transport", transport);
    Json regions = Json::object();
    for (auto const& attr : o.updateRegions)
    {
@@ -341,10 +353,13 @@ void MqttRTIambassador::subscribeObjectClassAttributesWithRegions(
       if (!updateRateDesignator.empty() && !_fdd->updateRate(toUtf8(updateRateDesignator), rate))
          throw InvalidUpdateRateDesignator(updateRateDesignator);
       for (auto const& pair : theAttributeHandleSetRegionHandleSetPairVector)
+      {
          forEachAttribute(pair.first, [&](std::uint64_t av, AttributeHandle const&) {
             for (RegionHandle const& r : pair.second)
                _regionSubscribedAttributes[cls][av].insert(RegionHandleFriend::value(r));
          });
+         setSubscribedRates(cls, pair.first, rate);
+      }
       recomputeSubscriptions();
    }
    updateBrokerSubscriptions();

@@ -188,6 +188,9 @@ void MqttRTIambassador::resetObjectState()
    _regionSubscribedAttributes.clear();
    _plainSubscribedInteractions.clear();
    _regionSubscribedInteractions.clear();
+   _subscribedRates.clear();
+   _interactionOrder.clear();
+   _interactionTransport.clear();
 }
 
 void MqttRTIambassador::updateBrokerSubscriptions()
@@ -330,6 +333,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          o.ownerClient = j["clientId"].str();
          for (std::string const& a : j["owned"].strings())
             o.ownedRemote.insert(parseHex(a));
+         for (auto const& kv : j["transport"].members())
+            o.transport[parseHex(kv.first)] = kv.second.str();
          o.topic = _fedTopic + "/" + rest.substr(0, rest.size() - 5);
          if (o.owner == _federateHandle || !_fdd->objectClass(o.objectClass))
             return;
@@ -343,6 +348,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             it->second.owner = o.owner; // ownership change (divestiture)
             it->second.ownerClient = o.ownerClient;
             it->second.ownedRemote = o.ownedRemote;
+            it->second.transport = o.transport;
          }
          if (!it->second.locallyDeleted)
             tryDiscover(it->second);
@@ -383,8 +389,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             if (!wanted.count(a))
                continue;
             values[AttributeHandleFriend::create(a)] = toVld(value);
-            Fdd::Attribute const* attr = _fdd->attribute(a);
-            allBestEffort = allBestEffort && attr && attr->transportation == "HLAbestEffort";
+            allBestEffort = allBestEffort && bestEffort(o, a);
          }
          if (values.empty())
             return;
@@ -399,7 +404,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
                          [h, values, t, tt, lt, mrh](FederateAmbassador& fa, OrderType received) {
                             fa.reflectAttributeValues(h, values, t, TIMESTAMP, tt, *lt, received, mrh,
                                                       SupplementalReflectInfo());
-                         });
+                         },
+                         retraction);
          }
          else if (lt)
             deliverRO([h, values, t, tt, lt](FederateAmbassador& fa) {
@@ -430,8 +436,9 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             if (_fdd->classHasParameter(received, p))
                values[ParameterHandleFriend::create(p)] = toVld(value);
          }
-         Fdd::InteractionClass const* ic = _fdd->interactionClass(cls);
-         TransportationType const tt = ic && ic->transportation == "HLAbestEffort" ? BEST_EFFORT : RELIABLE;
+         if (!_fdd->interactionClass(cls))
+            return;
+         TransportationType const tt = interactionBestEffort(sender, cls) ? BEST_EFFORT : RELIABLE;
          InteractionClassHandle const h = InteractionClassHandleFriend::create(received);
          VariableLengthData const t = toVld(tag);
          std::shared_ptr<LogicalTime> lt = timeFlag ? decodeTime(time) : nullptr;
@@ -442,7 +449,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
                          [h, values, t, tt, lt, mrh](FederateAmbassador& fa, OrderType receivedOrder) {
                             fa.receiveInteraction(h, values, t, TIMESTAMP, tt, *lt, receivedOrder, mrh,
                                                   SupplementalReceiveInfo());
-                         });
+                         },
+                         retraction);
          }
          else if (lt)
             deliverRO([h, values, t, tt, lt](FederateAmbassador& fa) {
@@ -483,6 +491,9 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
             deliverRO([h, t](FederateAmbassador& fa) { fa.removeObjectInstance(h, t, RECEIVE, SupplementalRemoveInfo()); });
          return;
       }
+      case WireKind::Retract:
+         handleRetraction(r.u64());
+         return;
       case WireKind::Request:
       {
          std::uint64_t const instance = r.u64();
@@ -629,6 +640,7 @@ void MqttRTIambassador::subscribeObjectClassAttributes(ObjectClassHandle theClas
       forEachAttribute(attributeList, [&](std::uint64_t av, AttributeHandle const&) {
          _plainSubscribedAttributes[theClassValue].insert(av);
       });
+      setSubscribedRates(theClassValue, attributeList, rate);
       recomputeSubscriptions();
    }
    updateBrokerSubscriptions();
@@ -964,8 +976,7 @@ void MqttRTIambassador::updateAttributeValues(ObjectInstanceHandle theObject,
             throw AttributeNotDefined(kv.first.toString());
          if (o.owner != _federateHandle || !o.owned.count(a))
             throw AttributeNotOwned(kv.first.toString());
-         Fdd::Attribute const* attr = _fdd->attribute(a);
-         if (attr->transportation != "HLAbestEffort")
+         if (!bestEffort(o, a))
             qos = 1;
       }
       topic = o.topic + "/update";
@@ -1005,10 +1016,9 @@ MessageRetractionHandle MqttRTIambassador::updateAttributeValues(ObjectInstanceH
          throw AttributeNotDefined(kv.first.toString());
       if (o.owner != _federateHandle || !o.owned.count(a))
          throw AttributeNotOwned(kv.first.toString());
-      Fdd::Attribute const* attr = _fdd->attribute(a);
-      int const k = (_time.regulating && attr->order == "TimeStamp") ? 1 : 0;
+      int const k = (_time.regulating && timestampOrder(o, a)) ? 1 : 0;
       parts[k][kv.first] = kv.second;
-      if (attr->transportation != "HLAbestEffort" || k == 1)
+      if (!bestEffort(o, a) || k == 1)
          qos[k] = 1;
    }
    bool const tso = !parts[1].empty() && sendsTso(true, ts);
@@ -1024,6 +1034,8 @@ MessageRetractionHandle MqttRTIambassador::updateAttributeValues(ObjectInstanceH
       for (auto const& kv : parts[k])
          w.u64(AttributeHandleFriend::value(kv.first)).bytes(kv.second.data(), kv.second.size());
       sendUpdate(*_transport, o.topic + "/update", w, qos[k]);
+      if (k == 1 && tso)
+         rememberSentTso(retraction, ts, o.topic + "/update");
    }
    return MessageRetractionHandleFriend::create(retraction);
 }
@@ -1059,7 +1071,7 @@ void MqttRTIambassador::sendInteraction(InteractionClassHandle theInteraction,
          if (!_fdd->classHasParameter(c, ParameterHandleFriend::value(kv.first)))
             throw InteractionParameterNotDefined(kv.first.toString());
       topic = _fedTopic + "/interactions/" + classTopicPath(ic->qualified) + "/@";
-      qos = ic->transportation == "HLAbestEffort" ? 0 : 1;
+      qos = interactionBestEffort(_federateHandle, c) ? 0 : 1;
    }
    WireWriter w(WireKind::Interaction);
    w.u64(_federateHandle).u64(nextSeq()).u64(c);
@@ -1087,14 +1099,17 @@ MessageRetractionHandle MqttRTIambassador::sendInteraction(InteractionClassHandl
    for (auto const& kv : theParameterValues)
       if (!_fdd->classHasParameter(c, ParameterHandleFriend::value(kv.first)))
          throw InteractionParameterNotDefined(kv.first.toString());
-   bool const tso = sendsTso(ic->order == "TimeStamp", TimeValue::of(theTime, timeIsInteger()));
+   TimeValue const ts = TimeValue::of(theTime, timeIsInteger());
+   bool const tso = sendsTso(interactionTimestampOrder(c), ts);
    WireWriter w(WireKind::Interaction);
    w.u64(_federateHandle).u64(nextSeq()).u64(c);
    w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u8(tso ? 2 : 1).bytes(time.data(), time.size());
    w.u64(retraction);
    writeParameters(w, theParameterValues);
-   sendUpdate(*_transport, _fedTopic + "/interactions/" + classTopicPath(ic->qualified) + "/@", w,
-              tso || ic->transportation != "HLAbestEffort" ? 1 : 0);
+   std::string const topic = _fedTopic + "/interactions/" + classTopicPath(ic->qualified) + "/@";
+   sendUpdate(*_transport, topic, w, tso || !interactionBestEffort(_federateHandle, c) ? 1 : 0);
+   if (tso)
+      rememberSentTso(retraction, ts, topic);
    return MessageRetractionHandleFriend::create(retraction);
 }
 
@@ -1154,7 +1169,7 @@ MessageRetractionHandle MqttRTIambassador::deleteObjectInstance(ObjectInstanceHa
       if (it->second.owner != _federateHandle)
          throw DeletePrivilegeNotHeld(theObject.toString());
       Fdd::Attribute const* priv = _fdd->findAttribute(it->second.objectClass, "HLAprivilegeToDeleteObject");
-      tso = sendsTso(priv && priv->order == "TimeStamp", TimeValue::of(theTime, timeIsInteger()));
+      tso = sendsTso(priv && timestampOrder(it->second, priv->handle), TimeValue::of(theTime, timeIsInteger()));
       o = it->second;
       _objects.erase(it);
    }

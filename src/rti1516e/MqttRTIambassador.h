@@ -115,6 +115,8 @@ private:
       std::set<std::uint64_t> ownedRemote; // attributes owned by the owner (from its info record)
       std::set<std::uint64_t> relevant;    // attributes notified by turnUpdatesOn (own objects)
       std::map<std::uint64_t, std::set<std::uint64_t>> updateRegions; // DDM: attribute -> our regions (9.5, 9.6)
+      std::map<std::uint64_t, OrderType> order;       // 8.23 changeAttributeOrderType (own objects)
+      std::map<std::uint64_t, std::string> transport; // 6.23 transportation changed by the owner (from info for others)
    };
 
    void subscribeJoinedTopics();
@@ -148,6 +150,15 @@ private:
    std::map<std::uint64_t, std::set<std::uint64_t>> _subscribedAttributes;
    std::set<std::uint64_t> _publishedInteractions;
    std::set<std::uint64_t> _subscribedInteractions;
+   std::map<std::uint64_t, std::map<std::uint64_t, double>> _subscribedRates; // class -> attribute -> update rate (Hz)
+   std::map<std::uint64_t, OrderType> _interactionOrder;       // 8.24 changeInteractionOrderType
+   std::map<std::uint64_t, std::string> _interactionTransport; // 6.27 requestInteractionTransportationTypeChange
+   // Effective order / transportation: change requested by this federate, else the FDD.
+   bool timestampOrder(ObjectInstance const& o, std::uint64_t attribute) const;  // _viewMutex
+   bool bestEffort(ObjectInstance const& o, std::uint64_t attribute) const;      // _viewMutex
+   bool interactionTimestampOrder(std::uint64_t interactionClass) const;          // _viewMutex
+   bool interactionBestEffort(std::uint64_t sender, std::uint64_t interactionClass) const; // _viewMutex
+   void setSubscribedRates(std::uint64_t cls, AttributeHandleSet const& attrs, double rate); // _viewMutex
    std::set<std::string> _coverTopics;   // object/interaction subscriptions on the broker
    std::set<std::wstring> _reservedNames;
    std::atomic<std::uint64_t> _seq{0};
@@ -162,6 +173,7 @@ private:
    {
       std::map<std::uint64_t, std::set<std::uint64_t>> objects; // class -> subscribed attributes
       std::set<std::uint64_t> interactions;
+      std::map<std::uint64_t, std::string> interactionTransport; // 6.27, class -> transportation
    };
    std::map<std::uint64_t, RemoteDeclarations> _remoteDecl; // other federates' subscriptions
    std::set<std::uint64_t> _classRelevanceOn;
@@ -271,7 +283,8 @@ private:
    void publishTimeState(bool meaningful);            // _viewMutex held, publishAsync
    void deliverRO(Callback cb);                       // _viewMutex held
    using TimedCallback = std::function<void(FederateAmbassador&, OrderType receivedOrder)>;
-   void deliverTimed(TimeValue const& ts, bool tso, TimedCallback cb); // _viewMutex held
+   // `retraction`: handle of a TSO message (0: not retractable).
+   void deliverTimed(TimeValue const& ts, bool tso, TimedCallback cb, std::uint64_t retraction = 0); // _viewMutex held
    // Send side (MqttObjects.cpp), _viewMutex held: true if the message goes TSO;
    // throws InvalidLogicalTime when the timestamp breaks the promise.
    bool sendsTso(bool timestampOrder, TimeValue const& ts);
@@ -281,7 +294,25 @@ private:
 
    std::map<std::uint64_t, TimeState> _timeStates; // other federates
    OwnTime _time;
-   std::multimap<TimeValue, TimedCallback> _tsoQueue;
+   struct QueuedTso
+   {
+      std::uint64_t retraction = 0;
+      TimedCallback cb;
+   };
+   std::multimap<TimeValue, QueuedTso> _tsoQueue;
+   void tsoDelivered(std::uint64_t retraction); // _viewMutex held: remembered for requestRetraction
+
+   // ----------------------------------------------- 8.21 retract (MqttTime.cpp)
+   struct SentTso
+   {
+      TimeValue time;
+      std::string topic;
+   };
+   std::map<std::uint64_t, SentTso> _sentTso;    // retraction handle -> TSO message we sent
+   std::set<std::uint64_t> _deliveredTso;        // retraction handles of TSO messages delivered to us
+   std::deque<std::uint64_t> _deliveredTsoOrder; // bounded memory
+   void rememberSentTso(std::uint64_t retraction, TimeValue const& ts, std::string const& topic); // _viewMutex
+   void handleRetraction(std::uint64_t retraction); // _viewMutex held
    std::deque<Callback> _roHeld;
    std::mt19937_64 _random{std::random_device{}()};
 
