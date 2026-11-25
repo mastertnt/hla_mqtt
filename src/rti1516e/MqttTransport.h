@@ -8,6 +8,23 @@
 //       empty retained payload    clean disconnect (record removed)
 //   <prefix>/sync/<clientId>      private round trip used by barrier()
 //
+// Session: clean (nothing stays on the broker). Publications made while
+// disconnected are buffered by Paho and sent on reconnection; non-retained
+// messages published by the others during an outage are lost, retained
+// records come again with the subscriptions.
+//
+// Reconnection (LocalSettings::reconnectSeconds): after an unexpected loss, a
+// housekeeping thread reconnects; the subscriptions are made again (with a
+// round trip, so that the retained records have all come again), the
+// presence goes "online" again, and the
+// ReconnectedHandler runs. ConnectionLostHandler only runs once the
+// reconnection window is over (at once when it is 0).
+//
+// Presence housekeeping (needs a subscription to <prefix>/clients/+): a
+// presence left "offline" for staleClientDelay() is removed (absent and
+// offline mean the same). A client that sees its own presence removed or
+// offline while connected publishes it "online" again.
+//
 // Incoming messages (other than sync) go to the MessageHandler, called on a
 // Paho thread: it must not block nor call back into the transport.
 #pragma once
@@ -25,6 +42,12 @@ class MqttTransport
 public:
    using ConnectionLostHandler = std::function<void(std::string const& cause)>;
    using MessageHandler = std::function<void(std::string const& topic, std::string const& payload)>;
+   // Reconnection phases: Resubscribing (retained records about to come
+   // again), then Synchronized (every retained record under the
+   // subscriptions has come again: a record that did not has been removed
+   // during the outage).
+   enum class ReconnectPhase { Resubscribing, Synchronized };
+   using ReconnectedHandler = std::function<void(ReconnectPhase)>;
 
    MqttTransport(LocalSettings settings, ConnectionLostHandler onLost, MessageHandler onMessage = nullptr);
    ~MqttTransport();
@@ -56,6 +79,10 @@ public:
    // messages of earlier subscriptions included) has gone through the
    // MessageHandler. Throws std::runtime_error on timeout.
    void barrier();
+
+   // Runs on the housekeeping thread, without any transport lock held. Set it
+   // before connect().
+   void setReconnectedHandler(ReconnectedHandler h);
 
    LocalSettings const& settings() const { return _settings; }
    std::string presenceTopic() const;

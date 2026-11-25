@@ -1,8 +1,10 @@
 #include "MqttRTIambassador.h"
 
 #include "LocalSettings.h"
+#include "Json.h"
 #include "MqttTransport.h"
 #include "Utf.h"
+#include "Wire.h"
 
 #include <chrono>
 #include <stdexcept>
@@ -89,6 +91,12 @@ void MqttRTIambassador::connect(FederateAmbassador& federateAmbassador,
       transport.reset(new MqttTransport(
          settings, [this](std::string const& cause) { onConnectionLost(cause); },
          [this](std::string const& topic, std::string const& payload) { onMessage(topic, payload); }));
+      transport->setReconnectedHandler([this](MqttTransport::ReconnectPhase p) {
+         if (p == MqttTransport::ReconnectPhase::Resubscribing)
+            onReconnecting();
+         else
+            onReconnected();
+      });
       transport->connect();
       // Presence of every client: tells live federate records from stale ones.
       transport->subscribe(settings.topicPrefix + "/clients/+");
@@ -147,6 +155,78 @@ void MqttRTIambassador::onConnectionLost(std::string const& cause)
    _joined = false;
    std::wstring description = L"MQTT: " + fromUtf8(cause);
    enqueue([description](FederateAmbassador& fa) { fa.connectionLost(description); });
+}
+
+// Transport housekeeping thread, after an outage shorter than the reconnect
+// setting. The others saw our Last Will: they removed our objects and stopped
+// counting us. Our retained federate, declaration and time records stayed on
+// the broker; the object info records are published again so that the others
+// discover our objects again. If the federation is gone (destroyed) or our
+// federate record was taken over, the federate is no longer a member: same
+// outcome as a lost connection.
+void MqttRTIambassador::onReconnecting()
+{
+   std::lock_guard<std::mutex> v(_viewMutex);
+   _resyncing = true;
+   _resyncSeen.clear();
+}
+
+void MqttRTIambassador::onReconnected()
+{
+   // Records removed during the outage (resigned federates, deleted objects,
+   // cleared presences...): not sent again, processed as removals.
+   std::vector<std::string> vanished;
+   {
+      std::lock_guard<std::mutex> v(_viewMutex);
+      _resyncing = false;
+      for (auto const& kv : _view)
+         if (!_resyncSeen.count(kv.first))
+            vanished.push_back(kv.first);
+      for (auto const& kv : _objects)
+      {
+         ObjectInstance const& o = kv.second;
+         if (o.owner != _federateHandle && !o.mom && !o.topic.empty() && !_resyncSeen.count(o.topic + "/info"))
+            vanished.push_back(o.topic + "/info");
+      }
+      _resyncSeen.clear();
+   }
+   for (std::string const& topic : vanished)
+      onMessage(topic, std::string());
+   if (!_connected)
+      return;
+   std::lock_guard<std::mutex> v(_viewMutex);
+   if (!_joined || !_transport || !_fdd)
+      return;
+   bool member = _view.count(_fedTopic + "/execution") != 0;
+   if (member)
+   {
+      auto it = _view.find(_fedTopic + "/federates/" + hex64(_federateHandle));
+      try
+      {
+         member = it != _view.end() && Json::parse(it->second)["clientId"].str() == _transport->settings().clientId;
+      }
+      catch (std::exception const&)
+      {
+         member = false;
+      }
+   }
+   if (!member)
+   {
+      _joined = false;
+      _connected = false;
+      enqueue([](FederateAmbassador& fa) {
+         fa.connectionLost(L"MQTT: reconnected, but the federation execution or the federate record is gone");
+      });
+      return;
+   }
+   for (auto const& kv : _objects)
+   {
+      ObjectInstance const& o = kv.second;
+      if (o.owner == _federateHandle && !o.mom)
+         _transport->publishAsync(o.topic + "/info", objectInfo(o), 1, true);
+   }
+   if (!_momInfoTopic.empty())
+      _transport->publishAsync(_momInfoTopic, _momInfoPayload, 1, true);
 }
 
 // ------------------------------------------------------ callback machinery

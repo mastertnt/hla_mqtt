@@ -201,6 +201,18 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
     set_property(TARGET hla-mom-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   endif()
   add_test(NAME mom COMMAND hla-mom-test)
+
+  # Reconnection and stale presences: needs a broker; a raw MQTT client cuts
+  # the connections.
+  add_executable(hla-robustness-test tests/robustness/main.cpp)
+  target_link_libraries(hla-robustness-test PRIVATE rti1516e ${PAHO_TARGET})
+  target_compile_definitions(hla-robustness-test PRIVATE
+    HLA_TEST_FOM_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/federation/foms")
+  if(MSVC)
+    target_compile_options(hla-robustness-test PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-robustness-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME robustness COMMAND hla-robustness-test)
 endif()
 
 # ---------------------------------------------------------------- install
@@ -211,5 +223,5 @@ install(TARGETS rti1516e fedtime1516e
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/RTI DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(HLA_MQTT_RTI_BUILD_TESTS)
-  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test hla-robustness-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

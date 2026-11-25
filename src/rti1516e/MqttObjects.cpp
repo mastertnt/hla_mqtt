@@ -281,7 +281,9 @@ void MqttRTIambassador::handlePresence(std::string const& clientId, std::string 
       {
       }
    }
-   if (online)
+   // Only the transition online -> offline/absent counts (a Last Will, then the
+   // removal of the stale presence, must not report the loss twice).
+   if (online || !clientAlive(clientId) || clientId == _transport->settings().clientId)
       return;
    momFederateLost(clientId); // HLAreportFederateLost, before the records go
    for (auto it = _objects.begin(); it != _objects.end();)

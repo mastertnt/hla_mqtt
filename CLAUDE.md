@@ -26,7 +26,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 
 ## Organisation du code
 - `src/rti1516e/MqttRTIambassador.*` : implémentation de `RTIambassador`.
-- `src/rti1516e/MqttTransport.*` : wrapper Paho (présence retained, Last Will).
+- `src/rti1516e/MqttTransport.*` : wrapper Paho (présence retained, Last Will, reconnexion, effacement des
+  présences offline périmées ; thread d'entretien).
 - `src/rti1516e/LocalSettings.*` : analyse de `localSettingsDesignator` (`mqtt://hôte:1883;clientId=...;prefix=hla`).
 - `src/rti1516e/generated/` : produit par `tools/gen_rti_sources.py` (exceptions et stubs). Pour implémenter
   un service : coder la méthode, ajouter son nom à `IMPLEMENTED` dans le script, puis relancer le script.
@@ -62,6 +63,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/time/main.cpp` : `hla-time-test` (broker requis), synchronisation et temps.
 - `tests/ddm/main.cpp` : `hla-ddm-test` (broker requis), services DDM 9.2 à 9.11 et 10.28 à 10.30.
 - `tests/mom/main.cpp` : `hla-mom-test` (broker requis), MOM (`src/rti1516e/MqttMom.cpp`).
+- `tests/robustness/main.cpp` : `hla-robustness-test` (broker requis, lié aussi à Paho : client brut qui
+  reprend un clientId ; se relance avec `--child` pour un fédéré tué sans resign).
 - `mim/HLAstandardMIM.xml` : MIM standard intégré à la DLL (tableau d'octets généré par `cmake/EmbedFile.cmake`).
 
 ## État au 2026-11-23
@@ -96,6 +99,9 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   fédéré, valeurs calculées) et HLAfederation (locale), HLArequest/HLAreport, HLAadjust, HLAservice (file
   interne hors portée de callback), HLAreportFederateLost. `hla-mom-test` 50/50 (4 exécutions), suite verte.
   Rapport d'invocation limité aux services MOM ; propriété et sauvegarde répondent HLAreportMOMexception.
+- **Robustesse, issues #38 et #3** (2026-11-25) : reconnexion automatique (`reconnect`, défaut 30 s ; session
+  propre, réabonnement + barrière, resynchronisation de la vue, republication des info d'objets), effacement
+  des présences offline après `staleClientDelay`. `hla-robustness-test` 13/13, suite verte.
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 
@@ -106,13 +112,16 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   -DHLA_MQTT_FEDTIME_LIBRARY_NAME=libfedtime1516e64`, dossier ajouté au PATH (ne rien copier dans C:\MAK).
 - VR-Link contrôle la version d'éditeur de liens PE de la DLL (14.00 attendu) : sinon f18 s'arrête,
   netdump plante. Aujourd'hui corrigé à la main sur une copie ; à intégrer au build (option).
-- Les processus tués laissent des topics retained (fédération, présence offline) : nettoyer le broker.
+- Les processus tués laissent des topics retained (fédération) : nettoyer le broker. Les présences offline
+  sont effacées automatiquement depuis #3.
 
 ## CI
 - `.github/workflows/ci.yml` : Windows (VS2022 v143, Release + Debug) et Linux (GCC 13), Conan 2, presets
   `conan-*`, Mosquitto pour les tests (`broker/mosquitto-hla.conf`). Dépôt : github.com/mastertnt/hla_mqtt (public).
 
 ## Règles de concurrence
+- Transport : le thread Paho prend `houseMutex` (présence, perte de connexion) ; ne jamais appeler Paho ni
+  l'outbox en tenant `houseMutex` (interblocage observé avec `client.is_connected()`).
 - Le thread Paho ne prend que `_viewMutex`. Ne jamais appeler un service bloquant du transport (publish
   synchrone, subscribe, unsubscribe, barrier) en tenant `_viewMutex` : calculer l'état sous le verrou, agir après.
 - `publishAsync` est sûr sous `_viewMutex` : toutes les publications passent par l'outbox de `MqttTransport`
@@ -129,6 +138,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - Avertissements C4251/C4275 : inhérents à l'API standard, neutralisés par `/wd4251 /wd4275`.
 - `Octet` est un `char` signé : convertir en `unsigned char` avant de recomposer un entier (handles MOM).
 - `for (x : Json::parse(s)["k"].items())` lit un temporaire détruit : garder le `Json` dans une variable.
+- Paho C : une connexion qui suit de près une déconnexion (même avec un autre handle) attend ~1 s. D'où la
+  session propre plutôt qu'une session persistante purgée par une connexion supplémentaire.
 
 ## Suite prévue
 1. `check_imports.py` sur un vrai fédéré (selftest Windows validé).
@@ -136,4 +147,3 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 3. Tester la substitution de DLL sur un vrai fédéré dès qu'un exécutable est disponible.
 4. Option de build « version d'éditeur de liens PE » (compatibilité VR-Link).
 5. Propriété, sauvegarde/restauration.
-5. Effacer la présence `offline` retained d'un client disparu (aujourd'hui elle reste sur le broker).

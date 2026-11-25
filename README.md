@@ -24,7 +24,7 @@ src/rti1516e/
   Handles.cpp           les 9 classes de handles (uint64, encodage 8 octets big-endian)
   VariableLengthData.cpp
   LocalSettings.*       analyse du localSettingsDesignator
-  MqttTransport.*       wrapper Paho MQTT C++ (présence et Last Will)
+  MqttTransport.*       wrapper Paho MQTT C++ (présence, Last Will, reconnexion)
   MqttRTIambassador.*   implémentation de RTIambassador (connexion, callbacks)
   MqttFederation.cpp    gestion de fédération (protocole MQTT décrit plus bas)
   MqttSupportServices.cpp  services de support (noms, handles, dimensions, temps)
@@ -44,6 +44,7 @@ tests/objects/          hla-objects-test : publish/subscribe, objets, interactio
 tests/time/             hla-time-test : points de synchronisation, gestion du temps
 tests/ddm/              hla-ddm-test : régions, associations, abonnements avec régions
 tests/mom/              hla-mom-test : MOM (objets HLAmanager, requêtes, rapports, services)
+tests/robustness/       hla-robustness-test : reconnexion, présences périmées
 mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
   gen_rti_sources.py    régénère generated/ à partir des headers
@@ -146,11 +147,31 @@ Ils passent par l'argument standard `localSettingsDesignator` de `connect()`, sa
 ""                                              -> variable HLA_MQTT_SETTINGS, sinon valeurs par défaut
 "mqtt://broker:1883"
 "mqtt://broker:1883;clientId=fed1;prefix=hla;connectTimeout=5;keepAlive=20"
+"mqtt://broker:1883;reconnect=60;staleClientDelay=300"
 "broker=mqtts://broker:8883;username=u;password=p"   (nécessite with_ssl)
 ```
 
 Le broker par défaut est donné par la variable d'environnement `HLA_MQTT_BROKER`, sinon `tcp://localhost:1883`.
 Une clé inconnue provoque `InvalidLocalSettingsDesignator`, un broker injoignable `ConnectionFailed`.
+
+| Clé | Défaut | Rôle |
+|---|---|---|
+| `reconnect` | 30 | durée (s) pendant laquelle la connexion est retentée après une perte inattendue, avant `connectionLost` ; 0 : `connectionLost` immédiat |
+| `staleClientDelay` | `reconnect` + 2 × `keepAlive` | durée (s) au-delà de laquelle une présence `offline` est effacée du broker |
+
+### Reconnexion
+
+Après une perte inattendue de la connexion, le transport retente toutes les secondes pendant `reconnect` secondes. Les publications faites entre-temps sont mises en tampon par Paho et envoyées à la reconnexion. À la reconnexion :
+
+- les abonnements sont refaits (session propre), suivis d'un aller-retour vers le broker : tous les enregistrements retained sont alors revenus, et ceux qui manquent (fédéré parti, objet supprimé, présence effacée pendant la coupure) sont traités comme supprimés ;
+- la présence repasse à `online` ; les enregistrements d'information des objets possédés (et l'objet MOM `HLAfederate`) sont republiés : les autres, qui avaient retiré ces objets à la réception du Last Will, les redécouvrent ;
+- si l'exécution a disparu ou si l'enregistrement du fédéré a été repris par un autre client, le fédéré reçoit `connectionLost` (il n'est plus membre).
+
+Le fédéré n'est pas averti d'une coupure surmontée. Pendant la coupure, ses appels de services synchrones échouent (`RTIinternalError`), et les messages non retained publiés par les autres (mises à jour, interactions) sont perdus. Les autres le considèrent comme absent : les points de synchronisation et la gestion du temps ne l'attendent pas.
+
+### Présences périmées
+
+Chaque client abonné aux présences note l'instant où une présence passe à `offline` (Last Will) et l'efface (publication retained vide) si elle l'est toujours après `staleClientDelay`. Les présences `offline` laissées par d'anciens processus sont donc effacées peu après la connexion d'un fédéré. Absente et `offline` ont le même sens. Un client qui voit sa propre présence effacée ou `offline` alors qu'il est connecté la republie `online`.
 
 ## Topics MQTT
 
@@ -158,7 +179,7 @@ Tous les topics sont retained, sauf `sync`. `F` est le nom de la fédération, e
 
 | Topic | Contenu |
 |---|---|
-| `<prefix>/clients/<clientId>` | `{"state":"online",...}` à la connexion ; Last Will `{"state":"offline",...}` publié par le broker en cas de perte ; payload vide à la déconnexion propre |
+| `<prefix>/clients/<clientId>` | `{"state":"online",...}` à la connexion ; Last Will `{"state":"offline",...}` publié par le broker en cas de perte ; payload vide à la déconnexion propre, ou après `staleClientDelay` à l'état `offline` |
 | `<prefix>/sync/<clientId>` (non retained) | aller-retour privé vers le broker (barrière) |
 | `<prefix>/federations/F/execution` | `{"name","timeImplementation","modules":[hash...],"createdBy",...}` |
 | `<prefix>/federations/F/fom/<hash>` | contenu XML d'un module FOM (hash = FNV-1a 64 bits des octets) |
@@ -240,6 +261,7 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente, `retract` (avant et après livraison, trop tard) et changement d'ordre des attributs et interactions.
 `hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région, puis le filtrage par recouvrement (déplacement des régions de mise à jour et d'abonnement), les avis de portée et de pertinence, `sendInteractionWithRegions` et `requestAttributeValueUpdateWithRegions`.
 `hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
+`hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
 Résultat attendu :
@@ -283,7 +305,6 @@ ctest --preset conan-release --output-on-failure
 ## Suite prévue
 
 - Gestion de la propriété, sauvegarde/restauration (et leurs parties MOM).
-- Présence `offline` (Last Will) d'un client disparu : reste retained sur le broker, rien ne l'efface.
 
 ---
 Headers : *Reprinted with permission from IEEE 1516.1(TM)-2010.*

@@ -133,6 +133,8 @@ std::string presenceOnline(std::string const& payload)
 void MqttRTIambassador::onMessage(std::string const& topic, std::string const& payload)
 {
    std::lock_guard<std::mutex> lock(_viewMutex);
+   if (_resyncing)
+      _resyncSeen.insert(topic);
    // Object and interaction traffic of the joined federation: not mirrored.
    if (_fdd && !_fedTopic.empty() && startsWith(topic, _fedTopic + "/"))
    {

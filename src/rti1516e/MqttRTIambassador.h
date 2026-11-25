@@ -69,6 +69,11 @@ private:
    void startDispatcher();
    void stopDispatcher();
    void onConnectionLost(std::string const& cause);
+   // Transport thread, after an outage shorter than the reconnect setting.
+   void onReconnecting(); // retained records about to come again
+   void onReconnected();  // they have: the ones that did not were removed during the outage
+   bool _resyncing = false;           // _viewMutex
+   std::set<std::string> _resyncSeen; // _viewMutex: topics received while resynchronizing
 
    // ------------------------------------------- jalon 2 (MqttFederation.cpp)
    struct FederateRecord
@@ -253,6 +258,7 @@ private:
    std::map<std::uint64_t, std::set<std::uint64_t>> _momInstancesUpdated, _momInstancesReflected; // class -> instances
    long long _momDeleted = 0, _momRemoved = 0;
    std::uint64_t _momFederateObject = 0;   // our HLAfederate instance
+   std::string _momInfoTopic, _momInfoPayload; // its retained info record (republished on reconnection)
    std::uint64_t _momFederationObject = 0; // local HLAfederation instance
    std::vector<std::wstring> _momJoinModules; // FOM modules supplied at join: designators and contents
    std::vector<std::string> _momJoinModuleData;

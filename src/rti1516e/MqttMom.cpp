@@ -325,6 +325,8 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
       _momClock = std::chrono::steady_clock::now();
       _momGrantedMs = _momAdvancingMs = 0;
       _momFederateObject = _momFederationObject = 0;
+      _momInfoTopic.clear();
+      _momInfoPayload.clear();
 
       if (Fdd::ObjectClass const* c = _fdd->objectClassByName(kFederateClass))
       {
@@ -345,6 +347,8 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
                published.owned.insert(a);
          infoTopic = o.topic + "/info";
          infoPayload = objectInfo(published);
+         _momInfoTopic = infoTopic;
+         _momInfoPayload = infoPayload;
       }
       if (Fdd::ObjectClass const* c = _fdd->objectClassByName(kFederationClass))
       {

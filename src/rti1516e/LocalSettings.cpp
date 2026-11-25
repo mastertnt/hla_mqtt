@@ -125,6 +125,10 @@ LocalSettings LocalSettings::parse(std::wstring const& designator)
          settings.username = value;
       else if (key == "password")
          settings.password = value;
+      else if (key == "reconnect")
+         settings.reconnectSeconds = toInt(key, value);
+      else if (key == "staleClientDelay")
+         settings.staleClientDelaySeconds = toInt(key, value);
       else
          throw std::invalid_argument("unknown setting: " + key);
    }

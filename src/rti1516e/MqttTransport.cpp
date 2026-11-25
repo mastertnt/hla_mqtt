@@ -12,7 +12,10 @@
 #include <cstdlib>
 #include <deque>
 #include <future>
+#include <map>
 #include <mutex>
+#include <set>
+#include <vector>
 #include <stdexcept>
 #include <thread>
 
@@ -30,14 +33,36 @@ std::string presencePayload(char const* state, std::string const& clientId)
 
 struct MqttTransport::Impl
 {
-   Impl(LocalSettings const& s)
+   Impl(LocalSettings const& s) : settings(s), client(s.brokerUri, s.clientId, createOptions()) {}
+
+   static mqtt::create_options createOptions()
+   {
       // Paho C refuses a publication once maxBufferedMessages commands wait in
       // its queue (default 100): a larger queue, and the sender retries anyway.
-      : client(s.brokerUri, s.clientId, mqtt::create_options(MQTTVERSION_3_1_1, 100000))
-   {
+      mqtt::create_options o(MQTTVERSION_3_1_1, 100000);
+      o.set_send_while_disconnected(true, false); // buffered during an outage
+      return o;
    }
+
+   LocalSettings settings;
    mqtt::async_client client;
    MessageHandler onMessage;
+   ConnectionLostHandler onLost;
+   ReconnectedHandler onReconnected;
+   std::string presenceTopic, presencePrefix, onlinePayload;
+
+   // Housekeeping thread: reconnection, stale presences (houseMutex).
+   std::mutex houseMutex;
+   std::condition_variable houseCv;
+   std::thread house;
+   bool stopHouse = false;
+   bool leaving = false;     // clean disconnect in progress: no reconnection, no presence repair
+   bool reconnecting = false;
+   std::string lostCause;
+   std::chrono::steady_clock::time_point lostAt, nextAttempt;
+   std::set<std::string> subscriptions;                            // made again on reconnection
+   std::map<std::string, std::chrono::steady_clock::time_point> offline; // other clients' presences
+   bool repairPresence = false;
    std::string syncTopic;
    std::mutex syncMutex;
    std::condition_variable syncCv;
@@ -159,8 +184,163 @@ struct MqttTransport::Impl
       outCv.wait_for(lock, timeout, [this] { return out.empty() && !sending; });
    }
 
+   // Paho thread: unexpected loss of the connection.
+   void connectionLost(std::string const& cause)
+   {
+      {
+         std::lock_guard<std::mutex> lock(houseMutex);
+         if (leaving || stopHouse)
+            return;
+         if (settings.reconnectSeconds > 0)
+         {
+            reconnecting = true;
+            lostCause = cause;
+            lostAt = nextAttempt = std::chrono::steady_clock::now();
+            houseCv.notify_all();
+            return;
+         }
+      }
+      if (onLost)
+         onLost(cause);
+   }
+
+   // Paho thread: presence records (other clients' and ours).
+   void presence(std::string const& topic, std::string const& payload)
+   {
+      bool const online = payload.find("\"state\":\"online\"") != std::string::npos;
+      std::lock_guard<std::mutex> lock(houseMutex);
+      if (topic == presenceTopic)
+      {
+         if (!online && !leaving)
+         {
+            repairPresence = true; // removed by another client, or our own Last Will
+            houseCv.notify_all();
+         }
+         return;
+      }
+      if (!payload.empty() && !online)
+         offline.emplace(topic, std::chrono::steady_clock::now()); // keeps the first sighting
+      else
+         offline.erase(topic);
+   }
+
+   void runHouse()
+   {
+      std::unique_lock<std::mutex> lock(houseMutex);
+      for (;;)
+      {
+         houseCv.wait_for(lock, std::chrono::milliseconds(250));
+         if (stopHouse)
+            return;
+         auto const now = std::chrono::steady_clock::now();
+         if (reconnecting && !leaving)
+         {
+            if (now - lostAt > std::chrono::seconds(settings.reconnectSeconds))
+            {
+               reconnecting = false;
+               std::string const cause = lostCause;
+               lock.unlock();
+               if (onLost)
+                  onLost(cause + " (no reconnection within " + std::to_string(settings.reconnectSeconds) + " s)");
+               lock.lock();
+               continue;
+            }
+            if (now < nextAttempt)
+               continue;
+            nextAttempt = now + std::chrono::seconds(1);
+            std::set<std::string> const subs = subscriptions;
+            lock.unlock();
+            bool const ok = tryReconnect(subs);
+            lock.lock();
+            if (!ok || leaving || stopHouse)
+               continue;
+            reconnecting = false;
+            repairPresence = false;
+            lock.unlock();
+            if (onReconnected)
+               onReconnected(ReconnectPhase::Synchronized);
+            lock.lock();
+            continue;
+         }
+         if (leaving)
+            continue;
+         // Paho and the outbox are called without houseMutex: the Paho
+         // thread takes houseMutex (presence, connectionLost) and Paho may
+         // hold its own lock meanwhile.
+         lock.unlock();
+         bool const connected = client.is_connected();
+         lock.lock();
+         if (!connected || leaving || reconnecting || stopHouse)
+            continue;
+         std::vector<Outgoing> out;
+         if (repairPresence)
+         {
+            repairPresence = false;
+            out.push_back(Outgoing{presenceTopic, onlinePayload, 1, true, nullptr});
+         }
+         auto const delay = std::chrono::seconds(settings.staleClientDelay());
+         for (auto it = offline.begin(); it != offline.end();)
+         {
+            if (now - it->second < delay)
+            {
+               ++it;
+               continue;
+            }
+            out.push_back(Outgoing{it->first, std::string(), 1, true, nullptr}); // stale presence removed
+            it = offline.erase(it);
+         }
+         if (out.empty())
+            continue;
+         lock.unlock();
+         for (Outgoing& o : out)
+            enqueue(std::move(o));
+         lock.lock();
+      }
+   }
+
+   // Housekeeping thread, no lock held.
+   bool tryReconnect(std::set<std::string> const& subs)
+   {
+      try
+      {
+         auto const timeout = std::chrono::seconds(settings.connectTimeoutSeconds + 1);
+         mqtt::token_ptr tok = client.reconnect();
+         if (!tok->wait_for(timeout))
+            return false;
+         enqueue(Outgoing{presenceTopic, onlinePayload, 1, true, nullptr});
+         if (onReconnected)
+            onReconnected(ReconnectPhase::Resubscribing);
+         for (std::string const& t : subs) // clean session: retained records come again
+            if (!client.subscribe(t, 1)->wait_for(timeout))
+               return false;
+         // Round trip: the broker sends the retained records of a subscription
+         // before the messages published after it.
+         std::uint64_t const n = ++nextSync;
+         if (!client.publish(syncTopic, std::to_string(n), 1, false)->wait_for(timeout))
+            return false;
+         std::unique_lock<std::mutex> lock(syncMutex);
+         return syncCv.wait_for(lock, timeout, [this, n] { return lastSyncSeen >= n; });
+      }
+      catch (std::exception const&)
+      {
+         return false;
+      }
+   }
+
+   void stopHousekeeping()
+   {
+      {
+         std::lock_guard<std::mutex> lock(houseMutex);
+         stopHouse = true;
+      }
+      houseCv.notify_all();
+      if (house.joinable())
+         house.join();
+   }
+
    void stop()
    {
+      stopHousekeeping();
       {
          std::lock_guard<std::mutex> lock(outMutex);
          stopSender = true;
@@ -182,16 +362,18 @@ MqttTransport::MqttTransport(LocalSettings settings, ConnectionLostHandler onLos
    {
       throw std::runtime_error(std::string("MQTT client creation failed: ") + e.what());
    }
-   _impl->client.set_connection_lost_handler(
-      [onLost](std::string const& cause)
-      {
-         if (onLost)
-            onLost(cause.empty() ? std::string("connection to MQTT broker lost") : cause);
-      });
-   _impl->onMessage = std::move(onMessage);
-   _impl->sender = std::thread([impl = _impl.get()] { impl->runSender(); });
-   _impl->syncTopic = _settings.topicPrefix + "/sync/" + _settings.clientId;
    Impl* impl = _impl.get();
+   _impl->onLost = std::move(onLost);
+   _impl->presenceTopic = presenceTopic();
+   _impl->presencePrefix = _settings.topicPrefix + "/clients/";
+   _impl->onlinePayload = presencePayload("online", _settings.clientId);
+   _impl->client.set_connection_lost_handler(
+      [impl](std::string const& cause)
+      { impl->connectionLost(cause.empty() ? std::string("connection to MQTT broker lost") : cause); });
+   _impl->onMessage = std::move(onMessage);
+   _impl->sender = std::thread([impl] { impl->runSender(); });
+   _impl->house = std::thread([impl] { impl->runHouse(); });
+   _impl->syncTopic = _settings.topicPrefix + "/sync/" + _settings.clientId;
    _impl->client.set_message_callback(
       [impl](mqtt::const_message_ptr msg)
       {
@@ -207,6 +389,8 @@ MqttTransport::MqttTransport(LocalSettings settings, ConnectionLostHandler onLos
             impl->syncCv.notify_all();
             return;
          }
+         if (topic.compare(0, impl->presencePrefix.size(), impl->presencePrefix) == 0)
+            impl->presence(topic, msg->get_payload_str());
          if (impl->onMessage)
          {
             try
@@ -227,6 +411,11 @@ MqttTransport::~MqttTransport()
       _impl->stop();
 }
 
+void MqttTransport::setReconnectedHandler(ReconnectedHandler h)
+{
+   _impl->onReconnected = std::move(h);
+}
+
 std::string MqttTransport::presenceTopic() const
 {
    return _settings.topicPrefix + "/clients/" + _settings.clientId;
@@ -238,7 +427,7 @@ void MqttTransport::connect()
                              presencePayload("offline", _settings.clientId), 1, true);
 
    auto builder = mqtt::connect_options_builder()
-                     .clean_session(true)
+                     .clean_session(true) // nothing left on the broker; subscriptions made again on reconnection
                      .automatic_reconnect(false)
                      .keep_alive_interval(std::chrono::seconds(_settings.keepAliveSeconds))
                      .connect_timeout(std::chrono::seconds(_settings.connectTimeoutSeconds))
@@ -248,12 +437,20 @@ void MqttTransport::connect()
    if (!_settings.password.empty())
       builder.password(_settings.password);
 
+   {
+      std::lock_guard<std::mutex> lock(_impl->houseMutex);
+      _impl->leaving = true; // until connected: a failed connect leaves nothing to clean
+   }
    try
    {
       auto timeout = std::chrono::seconds(_settings.connectTimeoutSeconds + 1);
       auto tok = _impl->client.connect(builder.finalize());
       if (!tok->wait_for(timeout))
          throw std::runtime_error("timeout while connecting to " + _settings.brokerUri);
+      {
+         std::lock_guard<std::mutex> lock(_impl->houseMutex);
+         _impl->leaving = false;
+      }
       subscribe(_impl->syncTopic);
       publish(presenceTopic(), presencePayload("online", _settings.clientId), 1, true);
    }
@@ -267,6 +464,13 @@ void MqttTransport::disconnect() noexcept
 {
    if (!_impl)
       return;
+   {
+      std::lock_guard<std::mutex> lock(_impl->houseMutex);
+      if (_impl->leaving)
+         return; // already disconnected (disconnect, then the destructor)
+      _impl->leaving = true;
+      _impl->reconnecting = false;
+   }
    try
    {
       if (_impl->client.is_connected())
@@ -294,6 +498,8 @@ void MqttTransport::subscribe(std::string const& topicFilter)
    {
       if (!_impl->client.subscribe(topicFilter, 1)->wait_for(std::chrono::seconds(_settings.connectTimeoutSeconds)))
          throw std::runtime_error("timeout while subscribing to " + topicFilter);
+      std::lock_guard<std::mutex> lock(_impl->houseMutex);
+      _impl->subscriptions.insert(topicFilter);
    }
    catch (mqtt::exception const& e)
    {
@@ -305,6 +511,10 @@ void MqttTransport::unsubscribe(std::string const& topicFilter) noexcept
 {
    try
    {
+      {
+         std::lock_guard<std::mutex> lock(_impl->houseMutex);
+         _impl->subscriptions.erase(topicFilter);
+      }
       if (_impl->client.is_connected())
          _impl->client.unsubscribe(topicFilter)->wait_for(std::chrono::seconds(_settings.connectTimeoutSeconds));
    }
