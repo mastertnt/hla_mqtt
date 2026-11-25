@@ -1,5 +1,6 @@
 #include "MqttTransport.h"
 
+#include "Log.h"
 #include "Version.h"
 #include "Utf.h"
 
@@ -129,6 +130,8 @@ struct MqttTransport::Impl
       {
          try
          {
+            HLA_MQTT_LOG(Debug, settings.clientId,
+                         "publish " << o.topic << " (" << o.payload.size() << " bytes" << (o.retained ? ", retained)" : ")"));
             return client.publish(o.topic, o.payload.data(), o.payload.size(), o.qos, o.retained);
          }
          catch (mqtt::exception const& e)
@@ -165,7 +168,7 @@ struct MqttTransport::Impl
       catch (...)
       {
       }
-      std::fprintf(stderr, "[hla-mqtt-rti] publication on %s lost: %s\n", o.topic.c_str(), why.c_str());
+      HLA_MQTT_LOG(Error, settings.clientId, "publication on " << o.topic << " lost: " << why);
    }
 
    void enqueue(Outgoing o)
@@ -191,6 +194,8 @@ struct MqttTransport::Impl
          std::lock_guard<std::mutex> lock(houseMutex);
          if (leaving || stopHouse)
             return;
+         HLA_MQTT_LOG(Warning, settings.clientId, "connection to " << settings.brokerUri << " lost: " << cause
+                                                 << (settings.reconnectSeconds > 0 ? " (reconnecting)" : ""));
          if (settings.reconnectSeconds > 0)
          {
             reconnecting = true;
@@ -239,6 +244,8 @@ struct MqttTransport::Impl
             {
                reconnecting = false;
                std::string const cause = lostCause;
+               HLA_MQTT_LOG(Error, settings.clientId,
+                            "no reconnection to " << settings.brokerUri << " within " << settings.reconnectSeconds << " s");
                lock.unlock();
                if (onLost)
                   onLost(cause + " (no reconnection within " + std::to_string(settings.reconnectSeconds) + " s)");
@@ -256,6 +263,7 @@ struct MqttTransport::Impl
                continue;
             reconnecting = false;
             repairPresence = false;
+            HLA_MQTT_LOG(Info, settings.clientId, "reconnected to " << settings.brokerUri);
             lock.unlock();
             if (onReconnected)
                onReconnected(ReconnectPhase::Synchronized);
@@ -286,6 +294,7 @@ struct MqttTransport::Impl
                ++it;
                continue;
             }
+            HLA_MQTT_LOG(Info, settings.clientId, "stale presence removed: " << it->first);
             out.push_back(Outgoing{it->first, std::string(), 1, true, nullptr}); // stale presence removed
             it = offline.erase(it);
          }
@@ -354,6 +363,17 @@ struct MqttTransport::Impl
 MqttTransport::MqttTransport(LocalSettings settings, ConnectionLostHandler onLost, MessageHandler onMessage)
    : _settings(std::move(settings))
 {
+   // Log settings of this connection (process-wide, see Log.h).
+   if (!_settings.logLevel.empty())
+      log::setLevel(log::parseLevel(_settings.logLevel));
+   if (_settings.logFileSet)
+      log::setFile(_settings.logFile);
+#if !HLA_MQTT_WITH_SSL
+   if (_settings.tls())
+      throw std::runtime_error("this RTI library is built without TLS support (Conan option with_ssl=True), "
+                               "cannot connect to " +
+                               _settings.brokerUri);
+#endif
    try
    {
       _impl.reset(new Impl(_settings));
@@ -389,6 +409,9 @@ MqttTransport::MqttTransport(LocalSettings settings, ConnectionLostHandler onLos
             impl->syncCv.notify_all();
             return;
          }
+         HLA_MQTT_LOG(Debug, impl->settings.clientId,
+                      "received " << topic << " (" << msg->get_payload().size() << " bytes"
+                                  << (msg->is_retained() ? ", retained)" : ")"));
          if (topic.compare(0, impl->presencePrefix.size(), impl->presencePrefix) == 0)
             impl->presence(topic, msg->get_payload_str());
          if (impl->onMessage)
@@ -436,6 +459,29 @@ void MqttTransport::connect()
       builder.user_name(_settings.username);
    if (!_settings.password.empty())
       builder.password(_settings.password);
+#if HLA_MQTT_WITH_SSL
+   if (_settings.tls())
+   {
+      // Server verification (certificate chain and host name) unless
+      // verifyServer=false; client certificate when certFile is set.
+      mqtt::ssl_options_builder ssl;
+      if (!_settings.caFile.empty())
+         ssl.trust_store(_settings.caFile);
+      if (!_settings.caPath.empty())
+         ssl.ca_path(_settings.caPath);
+      if (!_settings.certFile.empty())
+         ssl.key_store(_settings.certFile);
+      if (!_settings.keyFile.empty())
+         ssl.private_key(_settings.keyFile);
+      if (!_settings.keyPassword.empty())
+         ssl.private_keypassword(_settings.keyPassword);
+      ssl.enable_server_cert_auth(_settings.verifyServer);
+      ssl.verify(_settings.verifyServer);
+      std::string const clientId = _settings.clientId;
+      ssl.error_handler([clientId](std::string const& msg) { HLA_MQTT_LOG(Warning, clientId, "TLS: " << msg); });
+      builder.ssl(ssl.finalize());
+   }
+#endif
 
    {
       std::lock_guard<std::mutex> lock(_impl->houseMutex);
@@ -453,9 +499,12 @@ void MqttTransport::connect()
       }
       subscribe(_impl->syncTopic);
       publish(presenceTopic(), presencePayload("online", _settings.clientId), 1, true);
+      HLA_MQTT_LOG(Info, _settings.clientId,
+                   "connected to " << _settings.brokerUri << " (prefix " << _settings.topicPrefix << ")");
    }
    catch (mqtt::exception const& e)
    {
+      HLA_MQTT_LOG(Error, _settings.clientId, "cannot connect to " << _settings.brokerUri << ": " << e.what());
       throw std::runtime_error("cannot connect to " + _settings.brokerUri + ": " + e.what());
    }
 }
@@ -480,6 +529,7 @@ void MqttTransport::disconnect() noexcept
          _impl->drain(std::chrono::seconds(2));
          publish(presenceTopic(), std::string(), 1, true);
          _impl->client.disconnect()->wait_for(std::chrono::seconds(2));
+         HLA_MQTT_LOG(Info, _settings.clientId, "disconnected from " << _settings.brokerUri);
       }
    }
    catch (...)

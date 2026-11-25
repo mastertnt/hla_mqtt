@@ -12,6 +12,8 @@ option(HLA_MQTT_RTI_USE_UNIQUE_PTR
     "Map RTI_UNIQUE_PTR to std::unique_ptr (ABI of OpenRTI headers built in C++17 with GCC/Clang). OFF = std::auto_ptr, IEEE ABI."
     OFF)
 option(HLA_MQTT_RTI_BUILD_TESTS "Build the test federate" ON)
+option(HLA_MQTT_WITH_SSL
+    "TLS brokers (ssl://, mqtts://, wss://): Paho C built with OpenSSL (Conan option with_ssl=True)" OFF)
 option(HLA_MQTT_MAK_NAMES
     "MAK RTI file names (librti1516e64 / libfedtime1516e64 in 64 bits, without 64 in 32 bits) and PE linker version 14.00 (VR-Link). Overrides the two library names."
     OFF)
@@ -70,6 +72,7 @@ add_library(rti1516e SHARED
   src/rti1516e/Handles.cpp
   src/rti1516e/VariableLengthData.cpp
   src/rti1516e/LocalSettings.cpp
+  src/rti1516e/Log.cpp
   src/rti1516e/MqttTransport.cpp
   src/rti1516e/MqttRTIambassador.cpp
   src/rti1516e/MqttFederation.cpp
@@ -106,7 +109,8 @@ add_custom_command(
 target_include_directories(rti1516e
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/rti1516e)
-target_compile_definitions(rti1516e PRIVATE BUILDING_RTI RTI_DISABLE_WARNINGS)
+target_compile_definitions(rti1516e PRIVATE BUILDING_RTI RTI_DISABLE_WARNINGS
+  HLA_MQTT_WITH_SSL=$<BOOL:${HLA_MQTT_WITH_SSL}>)
 if(HLA_MQTT_RTI_USE_UNIQUE_PTR)
   target_compile_definitions(rti1516e PUBLIC HLA_MQTT_RTI_USE_UNIQUE_PTR)
 endif()
@@ -269,6 +273,28 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
   endif()
   add_test(NAME saverestore COMMAND hla-saverestore-test)
 
+  # Configuration (designator, file, environment) and log: white-box, no broker.
+  add_executable(hla-settings-test tests/settings/main.cpp src/rti1516e/LocalSettings.cpp src/rti1516e/Log.cpp)
+  target_include_directories(hla-settings-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/rti1516e)
+  if(MSVC)
+    target_compile_options(hla-settings-test PRIVATE /W3 /EHsc /utf-8)
+    set_property(TARGET hla-settings-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME settings COMMAND hla-settings-test)
+
+  # TLS (#39): needs a TLS broker (HLA_MQTT_TLS_DIR), skipped otherwise; without
+  # HLA_MQTT_WITH_SSL, checks that TLS brokers are refused.
+  add_executable(hla-tls-test tests/tls/main.cpp)
+  target_link_libraries(hla-tls-test PRIVATE rti1516e)
+  target_compile_definitions(hla-tls-test PRIVATE HLA_MQTT_WITH_SSL=$<BOOL:${HLA_MQTT_WITH_SSL}>
+    HLA_TEST_FOM_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/federation/foms")
+  if(MSVC)
+    target_compile_options(hla-tls-test PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-tls-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME tls COMMAND hla-tls-test)
+  set_tests_properties(tls PROPERTIES SKIP_RETURN_CODE 77)
+
   # Reconnection and stale presences: needs a broker; a raw MQTT client cuts
   # the connections.
   add_executable(hla-robustness-test tests/robustness/main.cpp)
@@ -296,5 +322,5 @@ install(TARGETS rti1516e fedtime1516e
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/RTI DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(HLA_MQTT_RTI_BUILD_TESTS)
-  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test hla-ownership-test hla-saverestore-test hla-robustness-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test hla-ownership-test hla-saverestore-test hla-settings-test hla-tls-test hla-robustness-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

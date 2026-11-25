@@ -23,6 +23,7 @@
 #include "Fdd.h"
 #include "Json.h"
 #include "HandleFriends.h"
+#include "Log.h"
 #include "MqttTransport.h"
 #include "Utf.h"
 #include "Version.h"
@@ -848,6 +849,9 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
       abandon();
       throw RTIinternalError(fromUtf8(e.what()));
    }
+   HLA_MQTT_LOG(Info, _transport->settings().clientId,
+                "joined " << toUtf8(federationName) << " as " << toUtf8(federateName) << " (handle " << hex64(handle)
+                          << ")");
    return FederateHandleFriend::create(handle);
 }
 
@@ -932,6 +936,7 @@ void MqttRTIambassador::resignFederationExecution(ResignAction resignAction)
       resetTime();
    }
    _joined = false;
+   HLA_MQTT_LOG(Info, _transport->settings().clientId, "resigned from " << toUtf8(_federationName));
    _federationName.clear();
    _federateName.clear();
    _federateType.clear();

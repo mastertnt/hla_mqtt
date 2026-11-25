@@ -1,18 +1,40 @@
-// Parsing of the `localSettingsDesignator` passed to RTIambassador::connect.
+// Configuration of a connection: the `localSettingsDesignator` passed to
+// RTIambassador::connect, a configuration file and environment variables
+// (README, "Configuration").
 //
-// Accepted forms (case-sensitive keys, ';' separated):
-//   ""                                   -> env HLA_MQTT_SETTINGS, else defaults
-//   "tcp://broker:1883"                  -> broker only
+// Sources, each one overriding the previous ones, key by key:
+//   1. defaults
+//   2. the file named by HLA_MQTT_CONFIG
+//   3. the variables HLA_MQTT_<KEY> (HLA_MQTT_BROKER, HLA_MQTT_CLIENT_ID, ...)
+//   4. the designator, or HLA_MQTT_SETTINGS when the designator is empty;
+//      a "config=<file>" item loads that file at its place in the list.
+//
+// Designator: items separated by ';', key=value, the first item may be a
+// bare broker URI:
 //   "mqtt://broker:1883;clientId=fed1;prefix=hla;connectTimeout=5"
-//   "broker=mqtt://broker:1883;username=u;password=p"
+// File: one key=value per line, '#' starts a comment.
 //
-// Keys: broker, clientId, prefix, connectTimeout (s), keepAlive (s),
-//       username, password, reconnect (s), staleClientDelay (s).
+// Keys (environment variable in parentheses):
+//   broker (HLA_MQTT_BROKER)                 tcp:// mqtt:// ssl:// mqtts:// ws:// wss://
+//   clientId (HLA_MQTT_CLIENT_ID)            generated when empty
+//   prefix (HLA_MQTT_PREFIX)                 topic prefix, "hla"
+//   connectTimeout (HLA_MQTT_CONNECT_TIMEOUT) s
+//   keepAlive (HLA_MQTT_KEEP_ALIVE)          s
+//   username, password (HLA_MQTT_USERNAME, HLA_MQTT_PASSWORD)
+//   reconnect (HLA_MQTT_RECONNECT)           s
+//   staleClientDelay (HLA_MQTT_STALE_CLIENT_DELAY) s
+//   caFile, caPath (HLA_MQTT_CA_FILE, HLA_MQTT_CA_PATH)       TLS: trusted CAs (PEM file, directory)
+//   certFile, keyFile (HLA_MQTT_CERT_FILE, HLA_MQTT_KEY_FILE) TLS: client certificate and its key (PEM)
+//   keyPassword (HLA_MQTT_KEY_PASSWORD)      TLS: password of an encrypted key
+//   verifyServer (HLA_MQTT_VERIFY_SERVER)    TLS: check the server certificate and host name (true)
+//   logLevel (HLA_MQTT_LOG_LEVEL)            off, error, warning, info, debug
+//   logFile (HLA_MQTT_LOG_FILE)              log appended to this file (stderr when empty)
 // Scheme mapping: mqtt:// -> tcp://, mqtts:// -> ssl://.
-// Default broker: env HLA_MQTT_BROKER, else tcp://localhost:1883.
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace hla_mqtt
 {
@@ -35,8 +57,22 @@ struct LocalSettings
    {
       return staleClientDelaySeconds >= 0 ? staleClientDelaySeconds : reconnectSeconds + 2 * keepAliveSeconds;
    }
+   // TLS (ssl:// and wss:// brokers).
+   std::string caFile, caPath;
+   std::string certFile, keyFile, keyPassword;
+   bool verifyServer = true;
+   bool tls() const { return brokerUri.rfind("ssl://", 0) == 0 || brokerUri.rfind("wss://", 0) == 0; }
+   // Log (Log.h); empty: unchanged.
+   std::string logLevel;
+   std::string logFile;
+   bool logFileSet = false;
 
    // Throws std::invalid_argument with a readable message on error.
    static LocalSettings parse(std::wstring const& designator);
+   // The same with an explicit environment (tests): returns "" for an unset variable.
+   using Environment = std::string (*)(char const* name);
+   static LocalSettings parse(std::wstring const& designator, Environment env);
+   // Keys and their environment variables, in documentation order.
+   static std::vector<std::pair<std::string, std::string>> keys();
 };
 }

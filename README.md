@@ -47,6 +47,9 @@ tests/ddm/              hla-ddm-test : régions, associations, abonnements avec 
 tests/mom/              hla-mom-test : MOM (objets HLAmanager, requêtes, rapports, services)
 tests/ownership/        hla-ownership-test : propriété (cessions, acquisitions concurrentes, resign)
 tests/saverestore/      hla-saverestore-test : sauvegarde et restauration de la fédération
+tests/settings/         hla-settings-test : configuration (désignateur, fichier, environnement) et journal
+tests/tls/              hla-tls-test : connexions TLS (broker TLS requis, sinon ignoré)
+config/                 exemple de fichier de configuration
 tests/robustness/       hla-robustness-test : reconnexion, présences périmées
 mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
@@ -110,7 +113,7 @@ Avec Docker : `docker compose -f broker/docker-compose.yml up`.
 | `mak_names` / `HLA_MQTT_MAK_NAMES` | `False` | Noms MÄK (`librti1516e64.dll`, `libfedtime1516e64.dll` en 64 bits, sans `64` en 32 bits) et version d'éditeur de liens PE 14.00 ; remplace les deux noms ci-dessus |
 | `pe_linker_version` / `HLA_MQTT_PE_LINKER_VERSION` | vide | Windows : version d'éditeur de liens écrite dans l'en-tête PE des DLL après l'édition de liens (`14.00` pour VR-Link) ; vide : inchangée (14.00 avec `mak_names`) |
 | `use_unique_ptr` / `HLA_MQTT_RTI_USE_UNIQUE_PTR` | `False` | `std::unique_ptr` au lieu de `std::auto_ptr` dans les signatures (ABI des headers OpenRTI en C++17 sous GCC/Clang) |
-| `with_ssl` | `False` | Paho avec TLS (`ssl://`, `mqtts://`) |
+| `with_ssl` / `HLA_MQTT_WITH_SSL` | `False` | Paho avec OpenSSL : brokers TLS (`ssl://`, `mqtts://`, `wss://`), voir [TLS](#tls) |
 
 Exemple (Conan 1) : `conan install . -pr:h profiles\conan1\vs2019-release -pr:b default -o library_name=rti1516e64 --build=missing`
 
@@ -148,25 +151,59 @@ Testé avec `f18HLA1516e_64.exe` (publie un F-18, FOM RPR) et `netdumpHLA1516e_6
 - VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance` : fonctionne depuis les callbacks d'avis (avant : il fallait `--ignoreAdvisories`).
 - Avertissements de l'essai sur les dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes : le MIM standard est désormais chargé (non revérifié avec VR-Link).
 
-## Paramètres de connexion
+## Configuration
 
-Ils passent par l'argument standard `localSettingsDesignator` de `connect()`, sans modification du fédéré :
+Les paramètres d'une connexion viennent de quatre sources ; chacune remplace, clé par clé, celles qui la précèdent :
+
+1. les valeurs par défaut ;
+2. le fichier désigné par la variable `HLA_MQTT_CONFIG` ;
+3. les variables d'environnement `HLA_MQTT_<CLÉ>` (tableau ci-dessous) ;
+4. l'argument standard `localSettingsDesignator` de `connect()`, ou, s'il est vide, la variable `HLA_MQTT_SETTINGS`. Un élément `config=<fichier>` y charge ce fichier à sa place dans la liste.
+
+Le fédéré n'a donc pas à être modifié : tout peut passer par l'environnement ou par un fichier.
 
 ```
-""                                              -> variable HLA_MQTT_SETTINGS, sinon valeurs par défaut
-"mqtt://broker:1883"
+""                                              -> HLA_MQTT_SETTINGS, sinon fichier, environnement, défauts
+"mqtt://broker:1883"                            -> premier élément : URI du broker
 "mqtt://broker:1883;clientId=fed1;prefix=hla;connectTimeout=5;keepAlive=20"
-"mqtt://broker:1883;reconnect=60;staleClientDelay=300"
-"broker=mqtts://broker:8883;username=u;password=p"   (nécessite with_ssl)
+"config=C:\hla\site.conf;clientId=fed1"         -> fichier, puis clientId
+"mqtts://broker:8883;caFile=ca.pem;certFile=client.pem;keyFile=client.key"
 ```
 
-Le broker par défaut est donné par la variable d'environnement `HLA_MQTT_BROKER`, sinon `tcp://localhost:1883`.
-Une clé inconnue provoque `InvalidLocalSettingsDesignator`, un broker injoignable `ConnectionFailed`.
+Fichier : une ligne `clé=valeur` par réglage, `#` commence un commentaire. Exemple commenté : [config/hla-mqtt.conf.example](config/hla-mqtt.conf.example).
 
-| Clé | Défaut | Rôle |
-|---|---|---|
-| `reconnect` | 30 | durée (s) pendant laquelle la connexion est retentée après une perte inattendue, avant `connectionLost` ; 0 : `connectionLost` immédiat |
-| `staleClientDelay` | `reconnect` + 2 × `keepAlive` | durée (s) au-delà de laquelle une présence `offline` est effacée du broker |
+| Clé | Variable | Défaut | Rôle |
+|---|---|---|---|
+| `broker` | `HLA_MQTT_BROKER` | `tcp://localhost:1883` | URI du broker : `tcp://`, `mqtt://`, `ssl://`, `mqtts://`, `ws://`, `wss://` (port par défaut 1883, 8883 en TLS) |
+| `clientId` | `HLA_MQTT_CLIENT_ID` | généré | identifiant MQTT, unique par connexion |
+| `prefix` | `HLA_MQTT_PREFIX` | `hla` | préfixe des topics (sépare des fédérations qui partagent un broker) |
+| `connectTimeout` | `HLA_MQTT_CONNECT_TIMEOUT` | 5 | délai (s) de connexion et d'abonnement |
+| `keepAlive` | `HLA_MQTT_KEEP_ALIVE` | 20 | keep-alive MQTT (s) |
+| `username`, `password` | `HLA_MQTT_USERNAME`, `HLA_MQTT_PASSWORD` | vides | authentification auprès du broker |
+| `reconnect` | `HLA_MQTT_RECONNECT` | 30 | durée (s) pendant laquelle la connexion est retentée après une perte inattendue, avant `connectionLost` ; 0 : `connectionLost` immédiat |
+| `staleClientDelay` | `HLA_MQTT_STALE_CLIENT_DELAY` | `reconnect` + 2 × `keepAlive` | durée (s) au-delà de laquelle une présence `offline` est effacée du broker |
+| `caFile` | `HLA_MQTT_CA_FILE` | vide | TLS : certificats des autorités reconnues pour le broker (PEM) ; vide : magasin du système |
+| `caPath` | `HLA_MQTT_CA_PATH` | vide | TLS : dossier de certificats d'autorités |
+| `certFile` | `HLA_MQTT_CERT_FILE` | vide | TLS : certificat client (PEM, peut contenir la clé) |
+| `keyFile` | `HLA_MQTT_KEY_FILE` | vide | TLS : clé privée du certificat client (PEM) |
+| `keyPassword` | `HLA_MQTT_KEY_PASSWORD` | vide | TLS : mot de passe d'une clé chiffrée |
+| `verifyServer` | `HLA_MQTT_VERIFY_SERVER` | `true` | TLS : vérifier le certificat du broker et le nom d'hôte ; `false` réservé aux essais |
+| `logLevel` | `HLA_MQTT_LOG_LEVEL` | `warning` | journal : `off`, `error`, `warning`, `info`, `debug` |
+| `logFile` | `HLA_MQTT_LOG_FILE` | vide | journal ajouté à ce fichier ; vide : stderr |
+
+Une clé inconnue, une valeur invalide (le message nomme la variable, ou le fichier et la ligne) ou des clés TLS avec un broker non TLS provoquent `InvalidLocalSettingsDesignator` ; un broker injoignable ou un certificat refusé, `ConnectionFailed`.
+
+### TLS
+
+Il faut une DLL construite avec Paho et OpenSSL : option Conan `with_ssl=True` et option CMake `HLA_MQTT_WITH_SSL=ON` (avec Conan 1 et le toolchain seul, passer `-DHLA_MQTT_WITH_SSL=ON` à CMake ; les presets générés la positionnent). Sans elle, une connexion à un broker TLS échoue avec `ConnectionFailed` (« built without TLS support »).
+
+Le certificat du broker et son nom d'hôte sont vérifiés (`caFile`, `caPath` ou magasin du système). Un broker qui exige un certificat client reçoit `certFile`/`keyFile`. Les erreurs OpenSSL apparaissent dans le journal au niveau `warning`.
+
+### Journal
+
+Niveaux : `error` (publication perdue, connexion perdue sans reconnexion, connexion impossible), `warning` (perte de connexion avec reconnexion, erreurs TLS), `info` (connexion, déconnexion, reconnexion, join, resign, présence perdue, présence périmée effacée), `debug` (chaque publication et chaque message reçu, avec topic et taille). Format : `<heure UTC ISO 8601> <NIVEAU> [<clientId>] <message>`.
+
+Le réglage vaut pour tout le processus : il est lu dans l'environnement au chargement de la DLL, puis à chaque `connect()` qui donne `logLevel` ou `logFile`. `HLA_MQTT_TRACE` (exceptions levées par la DLL, ci-dessus) reste indépendant.
 
 ### Reconnexion
 
@@ -318,6 +355,8 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
 `hla-ownership-test` (broker requis) couvre les services de propriété entre trois fédérés : requêtes (dont `attributeIsOwnedByRTI` pour un objet MOM), exceptions, cession inconditionnelle, acquisitions simultanées d'un attribut sans propriétaire (un seul gagnant, l'autre devient une demande au gagnant), cession négociée et confirmation, acquisition « si disponible », refus et annulations, `attributeOwnershipDivestitureIfWanted`, transfert du privilège de suppression puis suppression par le nouveau détenteur, actions de resign, perte d'un propriétaire sans resign, `HLAmodifyAttributeState` (prise, abandon, erreur).
 `hla-saverestore-test` (broker requis) couvre sauvegarde et restauration : callbacks et leur ordre, requêtes de statut, exceptions (services refusés pendant la sauvegarde ou la restauration), état restauré (propriété, objet enregistré après la sauvegarde oublié, déclarations, temps logique et contrainte), sauvegarde horodatée avec un fédéré contraint, `federateSaveNotComplete` et `federateRestoreNotComplete`, abandons, membre qui quitte ou disparaît pendant une sauvegarde, restauration refusée (label inconnu, autre ensemble de fédérés) et restauration dans un nouveau fédéré qui reprend le nom et le handle sauvegardés.
+`hla-settings-test` (sans broker) couvre la configuration : toutes les clés, valeurs par défaut, erreurs, fichier (commentaires, erreur avec fichier et ligne), variables d'environnement et ordre de priorité, `config=` dans le désignateur, niveaux et format du journal.
+`hla-tls-test` couvre TLS avec le broker décrit par `HLA_MQTT_TLS_DIR` (`ca.pem`, `other-ca.pem`, `client.pem`, `client.key` ; ports 8883 sans certificat client et 8884 avec) : vérification du serveur, autorité inconnue refusée, `verifyServer=false`, certificat client exigé puis accepté, fédération complète sur TLS. Sans `HLA_MQTT_TLS_DIR` il est ignoré ; dans une DLL sans TLS il vérifie le refus des brokers TLS.
 `hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 

@@ -32,6 +32,7 @@
 #include "Fdd.h"
 #include "HandleFriends.h"
 #include "Json.h"
+#include "Log.h"
 #include "MqttTransport.h"
 #include "Utf.h"
 #include "Wire.h"
@@ -302,6 +303,7 @@ bool MqttRTIambassador::handlePresence(std::string const& clientId, std::string 
    // removal of the stale presence, must not report the loss twice).
    if (online || !clientAlive(clientId) || clientId == _transport->settings().clientId)
       return false;
+   HLA_MQTT_LOG(Info, _transport->settings().clientId, "presence lost: " << clientId);
    momFederateLost(clientId); // HLAreportFederateLost, before the records go
    return true; // then ownershipPresenceLost, once the presence is recorded offline
 }

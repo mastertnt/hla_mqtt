@@ -46,6 +46,7 @@ class HlaMqttRtiConan(ConanFile):
         tc.cache_variables["HLA_MQTT_RTI_LIBRARY_NAME"] = str(self.options.library_name)
         tc.cache_variables["HLA_MQTT_RTI_USE_UNIQUE_PTR"] = bool(self.options.use_unique_ptr)
         tc.cache_variables["HLA_MQTT_MAK_NAMES"] = bool(self.options.mak_names)
+        tc.cache_variables["HLA_MQTT_WITH_SSL"] = bool(self.options.with_ssl)
         tc.cache_variables["HLA_MQTT_PE_LINKER_VERSION"] = str(self.options.pe_linker_version)
         tc.generate()
 

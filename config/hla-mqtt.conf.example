@@ -1,0 +1,26 @@
+# Configuration of hla-mqtt-rti (README, "Configuration").
+# Loaded with HLA_MQTT_CONFIG=<this file>, or "config=<this file>" in the
+# localSettingsDesignator passed to connect(). One key=value per line;
+# environment variables HLA_MQTT_<KEY> and the designator override it.
+
+broker = mqtt://localhost:1883      # tcp:// mqtt:// ssl:// mqtts:// ws:// wss://
+prefix = hla                        # topic prefix: separate federations sharing a broker
+# clientId = federate-1             # generated when absent (must be unique per connection)
+connectTimeout = 5                  # s
+keepAlive = 20                      # s
+reconnect = 30                      # s of reconnection attempts before connectionLost (0: none)
+# staleClientDelay = 70             # s before an offline presence is removed (default reconnect + 2 x keepAlive)
+# username = federate
+# password = secret
+
+# TLS (ssl:// or mqtts:// broker; library built with with_ssl=True)
+# caFile = /etc/hla-mqtt/ca.pem     # CA certificates trusted for the broker (PEM)
+# caPath = /etc/ssl/certs           # directory of trusted CA certificates
+# certFile = /etc/hla-mqtt/client.pem   # client certificate (PEM; may also hold the key)
+# keyFile = /etc/hla-mqtt/client.key    # its private key (PEM)
+# keyPassword = secret              # password of an encrypted private key
+# verifyServer = true               # false: no check of the broker certificate nor host name (tests only)
+
+# Log
+logLevel = warning                  # off, error, warning, info, debug
+# logFile = hla-mqtt.log            # appended; stderr when absent

@@ -71,6 +71,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/mom/main.cpp` : `hla-mom-test` (broker requis), MOM (`src/rti1516e/MqttMom.cpp`).
 - `tests/ownership/main.cpp` : `hla-ownership-test` (broker requis), propriété (`MqttOwnership.cpp`).
 - `tests/saverestore/main.cpp` : `hla-saverestore-test` (broker requis), sauvegarde/restauration.
+- `tests/settings/main.cpp` : `hla-settings-test` (sans broker, compile LocalSettings.cpp et Log.cpp).
+- `tests/tls/main.cpp` : `hla-tls-test` (broker TLS décrit par `HLA_MQTT_TLS_DIR`, sinon code 77 = ignoré).
 - `tests/robustness/main.cpp` : `hla-robustness-test` (broker requis, lié aussi à Paho : client brut qui
   reprend un clientId ; se relance avec `--child` pour un fédéré tué sans resign).
 - `mim/HLAstandardMIM.xml` : MIM standard intégré à la DLL (tableau d'octets généré par `cmake/EmbedFile.cmake`).
@@ -119,6 +121,11 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - **Sauvegarde/restauration, issues #28 à #33** (2026-11-25) : services et callbacks 4.16 à 4.32, état RTI
   persistant par label (`F/saves/<label>/...`), restauration en deux phases (effacement par tous, puis
   chargement), correspondance des identités par type. `hla-saverestore-test` 68/68.
+- **Exploitation, issues #39 à #41** (2026-11-25) : configuration unifiée (`LocalSettings` : défauts, fichier
+  `HLA_MQTT_CONFIG`, variables `HLA_MQTT_<CLÉ>`, désignateur avec `config=`), journal `Log.h`
+  (`HLA_MQTT_LOG`, niveaux, fichier), TLS (`ssl_options` Paho, `HLA_MQTT_WITH_SSL`). Avec Conan 1, les
+  `cache_variables` ne passent que par les presets : `-DHLA_MQTT_WITH_SSL=ON` à la main avec le toolchain.
+  `hla-settings-test` 29/29 ; `hla-tls-test` 7/7 sur un Mosquitto TLS local (build `build-ssl`).
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 
