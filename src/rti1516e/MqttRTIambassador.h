@@ -33,6 +33,7 @@ class MqttTransport;
 class Fdd;
 }
 #include "Extents.h"
+#include "Json.h"
 #include "TimeValue.h"
 namespace hla_mqtt
 {
@@ -119,26 +120,79 @@ private:
    std::atomic<ResignAction> _automaticResignDirective{CANCEL_THEN_DELETE_THEN_DIVEST};
 
    // ------------------------------------------- jalon 3 (MqttObjects.cpp)
+   // Ownership (MqttOwnership.cpp): acquisition requested from us (we own the attribute).
+   struct OwnershipRequest
+   {
+      std::uint64_t federate = 0;
+      bool ifAvailable = false;
+   };
+   // Our pending acquisition of one attribute.
+   struct Acquisition
+   {
+      bool ifAvailable = false;
+      std::string tag;
+      std::uint64_t askedTo = 0; // owner the request was sent to (0: none)
+      bool cancelling = false;
+   };
    struct ObjectInstance
    {
       std::uint64_t handle = 0;
       std::uint64_t objectClass = 0; // registered class
-      std::uint64_t owner = 0;       // federate handle, 0 = no owner (divested)
-      std::string ownerClient;
       std::string name;
       std::string topic;               // .../objects/<class path>/@<handle>
-      std::uint64_t knownClass = 0;    // discovered as (0 = not discovered)
+      std::uint64_t knownClass = 0;    // known as (registered class for ours; 0 = not known)
+      bool registered = false;         // registered by this federate
+      std::uint64_t registrant = 0;    // federate that registered it (info record)
       bool locallyDeleted = false;     // rediscovered on the next update only
-      std::set<std::uint64_t> owned;   // attributes owned by us (own objects)
-      std::set<std::uint64_t> ownedRemote; // attributes owned by the owner (from its info record)
-      std::set<std::uint64_t> relevant;    // attributes notified by turnUpdatesOn (own objects)
+      std::set<std::uint64_t> owned;   // attributes owned by this federate
+      std::set<std::uint64_t> relevant;    // attributes notified by turnUpdatesOn (owned attributes)
       std::map<std::uint64_t, std::set<std::uint64_t>> updateRegions; // DDM: attribute -> our regions (9.5, 9.6)
-      std::map<std::uint64_t, OrderType> order;       // 8.23 changeAttributeOrderType (own objects)
-      std::map<std::uint64_t, std::string> transport; // 6.23 transportation changed by the owner (from info for others)
-      std::map<std::uint64_t, std::vector<Extents>> remoteRegions; // DDM: owner's update regions (from info)
+      std::map<std::uint64_t, OrderType> order;       // 8.23 changeAttributeOrderType (owned attributes)
+      std::map<std::uint64_t, std::string> transport; // 6.23 transportation changed by us (owned attributes)
       std::set<std::uint64_t> scope; // attributes notified in scope (attributeScopeAdvisory)
       bool mom = false; // local MOM entry (our HLAfederate, HLAfederation): values computed by the RTI
+      // Ownership, this federate's side (MqttOwnership.cpp).
+      std::set<std::uint64_t> offered;                  // negotiated divestiture in progress
+      std::set<std::uint64_t> claims;                   // unowned attributes being claimed
+      std::map<std::uint64_t, std::uint64_t> given;     // attribute -> federate granted (until it owns it)
+      std::map<std::uint64_t, std::vector<OwnershipRequest>> requests; // acquisitions requested from us
+      std::map<std::uint64_t, Acquisition> acquiring;   // our pending acquisitions
+      int recordsInFlight = 0;                          // own owner records not yet echoed
    };
+   // Retained owner record of another federate (F/owners/<instance>/<federate>).
+   struct OwnerRecord
+   {
+      std::string clientId;
+      std::set<std::uint64_t> owned, claims;
+      std::map<std::uint64_t, std::uint64_t> given;
+      std::map<std::uint64_t, std::string> transport;
+      std::map<std::uint64_t, std::vector<Extents>> regions;
+   };
+   std::map<std::uint64_t, std::map<std::uint64_t, OwnerRecord>> _ownerRecords; // instance -> federate -> record
+   std::uint64_t _ownershipMarks = 0;
+   std::map<std::uint64_t, std::uint64_t> _pendingMarks; // marker token -> instance
+   // The following require _viewMutex.
+   std::uint64_t privilegeAttribute() const;
+   std::uint64_t ownerOf(ObjectInstance const& o, std::uint64_t attribute) const; // 0: unowned
+   OwnerRecord const* liveRecord(std::uint64_t instance, std::uint64_t federate) const;
+   bool federateAlive(std::uint64_t federate) const;
+   bool staleObject(std::uint64_t instance) const; // its delete privilege holder is gone
+   std::string ownerRecordTopic(std::uint64_t instance, std::uint64_t federate) const;
+   std::string ownerRecord(ObjectInstance const& o) const;
+   std::pair<std::string, std::string> ownerRecordEntry(ObjectInstance const& o) const;
+   void publishOwnerRecord(ObjectInstance& o); // async
+   std::vector<std::string> recordTopicsOf(std::uint64_t instance) const;
+   void sendOwnership(std::uint64_t to, Json const& message); // async; to 0: all federates
+   void handleOwnershipTraffic(std::string const& rest, std::string const& payload);
+   void handleOwnerRecord(std::uint64_t instance, std::uint64_t federate, std::string const& payload);
+   void handleOwnershipMessage(std::uint64_t to, std::string const& payload);
+   bool driveAcquisitions(ObjectInstance& o); // true: owner record published
+   void grant(ObjectInstance& o, std::set<std::uint64_t> const& attrs);
+   void divest(ObjectInstance& o, std::set<std::uint64_t> const& attrs); // unconditional
+   void cancelAcquisitions(ObjectInstance& o, std::set<std::uint64_t> const& attrs, bool notify);
+   void ownershipPresenceLost(std::string const& clientId);
+   ObjectInstance& ownershipObject(ObjectInstanceHandle const& h, AttributeHandleSet const& attrs,
+                                   std::set<std::uint64_t>& values); // known object, defined attributes
 
    void subscribeJoinedTopics();
    void unsubscribeJoinedTopics() noexcept;
@@ -146,7 +200,7 @@ private:
    void resetObjectState(); // requires _viewMutex
    // Paho thread, _viewMutex held:
    void handleObjectTraffic(std::string const& rest, std::string const& payload);
-   void handlePresence(std::string const& clientId, std::string const& payload);
+   bool handlePresence(std::string const& clientId, std::string const& payload); // true: presence lost
    void tryDiscover(ObjectInstance& o);
    void discoverPending();
    // Federate thread, no lock held: broker subscriptions follow the declarations.
@@ -159,8 +213,10 @@ private:
    std::uint64_t newUniqueValue(char const* kind);
    std::string encodeTime(LogicalTime const& theTime) const;
    std::shared_ptr<LogicalTime> decodeTime(std::string const& encoded) const;
-   void deleteOwnObject(ObjectInstance const& o, VariableLengthData const& tag, std::string const& time,
-                        bool tso = false);
+   // Deletes an object we hold the delete privilege of: delete message, info and
+   // owner records cleared. No lock held.
+   void deleteOwnObject(ObjectInstance const& o, std::vector<std::string> const& records, VariableLengthData const& tag,
+                        std::string const& time, bool tso = false);
    void reserveNames(std::set<std::wstring> const& names, bool multiple);
 
    std::map<std::uint64_t, ObjectInstance> _objects; // own + seen from info records
@@ -231,9 +287,9 @@ private:
                          bool context = true) const;
    void checkRegionContext(std::uint64_t region, std::vector<std::string> const& dimensionNames) const;
    bool regionInUse(std::uint64_t region) const;
-   std::string objectInfo(ObjectInstance const& o) const; // retained info record, with the update regions
-   // Info records of our objects whose update regions changed: (topic, payload).
-   std::vector<std::pair<std::string, std::string>> infoRecordsUsing(std::set<std::uint64_t> const& regions) const;
+   std::string objectInfo(ObjectInstance const& o) const; // retained info record (instance, class, name)
+   // Owner records of our objects whose update regions changed: (topic, payload).
+   std::vector<std::pair<std::string, std::string>> infoRecordsUsing(std::set<std::uint64_t> const& regions); // owner records
    void publishInfoRecords(std::vector<std::pair<std::string, std::string>> const& records);
    ObjectInstanceHandle registerObject(ObjectClassHandle theClass, std::wstring const& name,
                                        AttributeHandleSetRegionHandleSetPairVector const* regions);
@@ -258,7 +314,8 @@ private:
    std::map<std::uint64_t, std::set<std::uint64_t>> _momInstancesUpdated, _momInstancesReflected; // class -> instances
    long long _momDeleted = 0, _momRemoved = 0;
    std::uint64_t _momFederateObject = 0;   // our HLAfederate instance
-   std::string _momInfoTopic, _momInfoPayload; // its retained info record (republished on reconnection)
+   std::string _momInfoTopic, _momInfoPayload;     // its retained info record (republished on reconnection)
+   std::string _momRecordTopic, _momRecordPayload; // its owner record: all attributes owned by us
    std::uint64_t _momFederationObject = 0; // local HLAfederation instance
    std::vector<std::wstring> _momJoinModules; // FOM modules supplied at join: designators and contents
    std::vector<std::string> _momJoinModuleData;

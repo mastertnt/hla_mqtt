@@ -228,8 +228,11 @@ void MqttRTIambassador::evaluateAdvisories()
    for (auto& kv : _objects)
    {
       ObjectInstance& o = kv.second;
-      if (o.owner != _federateHandle)
+      if (o.owned.empty() || o.mom)
+      {
+         o.relevant.clear();
          continue;
+      }
       if (!_advisorySwitches[1])
       {
          o.relevant.clear();
@@ -277,7 +280,7 @@ void MqttRTIambassador::evaluateAdvisories()
 
 void MqttRTIambassador::evaluateScope(ObjectInstance& o)
 {
-   if (o.knownClass == 0 || o.owner == _federateHandle)
+   if (o.knownClass == 0)
       return;
    if (!_advisorySwitches[2])
    {
@@ -288,7 +291,7 @@ void MqttRTIambassador::evaluateScope(ObjectInstance& o)
    auto it = _subscribedAttributes.find(o.knownClass);
    if (it != _subscribedAttributes.end())
       for (std::uint64_t a : it->second)
-         if (o.ownedRemote.count(a) && subscriptionCovers(o.knownClass, a, updateExtents(o, a)))
+         if (ownerOf(o, a) != 0 && !o.owned.count(a) && subscriptionCovers(o.knownClass, a, updateExtents(o, a)))
             scope.insert(a);
    AttributeHandleSet in, out;
    for (std::uint64_t a : scope)

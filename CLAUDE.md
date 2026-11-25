@@ -39,11 +39,13 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   en tête de fichier) ; `TimeValue.h` : temps comparables et bornes (ouvertes/fermées).
 - `src/rti1516e/MqttAdvisories.cpp` : callbacks d'avis à partir des abonnements publiés (`F/decl/<fédéré>`) ;
   commutateurs initialisés par les `<switches>` du FOM.
+- `src/rti1516e/MqttOwnership.cpp` : propriété (chapitre 7) ; enregistrements `F/owners/<instance>/<fédéré>`,
+  messages `F/ownership/...`, revendication par marqueur ; protocole décrit en tête du fichier.
 - `src/rti1516e/MqttObjectOptions.cpp` : ordre et transport des messages envoyés (8.23, 8.24, 6.23 à 6.30),
   `getUpdateRateValueForAttribute` ; `retract` est dans `MqttTime.cpp` (message `WireKind::Retract`).
 - `src/rti1516e/MqttRegions.cpp` : DDM (régions, associations de mise à jour, abonnements avec régions,
   10.28 à 10.30) ; abonnement effectif = union abonnement sans région / avec régions
-  (`recomputeSubscriptions`) ; régions de mise à jour publiées dans l'enregistrement `info` ; filtrage
+  (`recomputeSubscriptions`) ; régions de mise à jour publiées dans l'enregistrement de propriété ; filtrage
   par recouvrement à la réception (`subscriptionCovers`, `interactionCovers`, `Extents.h`).
 - `src/rti1516e/Trace.cpp` : `HLA_MQTT_TRACE` (Windows), trace des exceptions HLA levées par la DLL.
 - `src/rti1516e/Fdd.*` : FDD fusionné, handles = FNV-1a 64 du nom qualifié ; `Xml.*`, `Json.h` : parseurs maison
@@ -63,6 +65,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/time/main.cpp` : `hla-time-test` (broker requis), synchronisation et temps.
 - `tests/ddm/main.cpp` : `hla-ddm-test` (broker requis), services DDM 9.2 à 9.11 et 10.28 à 10.30.
 - `tests/mom/main.cpp` : `hla-mom-test` (broker requis), MOM (`src/rti1516e/MqttMom.cpp`).
+- `tests/ownership/main.cpp` : `hla-ownership-test` (broker requis), propriété (`MqttOwnership.cpp`).
 - `tests/robustness/main.cpp` : `hla-robustness-test` (broker requis, lié aussi à Paho : client brut qui
   reprend un clientId ; se relance avec `--child` pour un fédéré tué sans resign).
 - `mim/HLAstandardMIM.xml` : MIM standard intégré à la DLL (tableau d'octets généré par `cmake/EmbedFile.cmake`).
@@ -84,7 +87,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   à jour, commutateurs d'avis mémorisés (sans callbacks). `hla-objects-test` 44/44 en Release et Debug
   (4 exécutions), ~2000 mises à jour/s mesurées dans un test mono-thread (borne basse). Broker propre après tests.
   Après le join, le fédéré n'est plus abonné à `F/#` mais à ses topics propres + couverture des classes.
-  Pas de propriété transférable.
+  Propriété transférable depuis (issues #13 à #20).
 - **Jalon 4 fait** (2026-11-23) : points de synchronisation, gestion du temps (régulation, contrainte,
   TAR/TARA/NER/NERA/FQR, TSO, GALT/LITS, lookahead, livraison asynchrone). `hla-time-test` 43/43 en Release
   et Debug (+3 exécutions) ; tous les tests précédents verts ; broker propre. Boucles 2 fédérés :
@@ -98,10 +101,16 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - **MOM, issues #34 à #37** (2026-11-25) : MIM standard fusionné à la création, objets HLAfederate (un par
   fédéré, valeurs calculées) et HLAfederation (locale), HLArequest/HLAreport, HLAadjust, HLAservice (file
   interne hors portée de callback), HLAreportFederateLost. `hla-mom-test` 50/50 (4 exécutions), suite verte.
-  Rapport d'invocation limité aux services MOM ; propriété et sauvegarde répondent HLAreportMOMexception.
+  Rapport d'invocation limité aux services MOM ; HLAmodifyAttributeState et sauvegarde répondent
+  HLAreportMOMexception.
 - **Robustesse, issues #38 et #3** (2026-11-25) : reconnexion automatique (`reconnect`, défaut 30 s ; session
   propre, réabonnement + barrière, resynchronisation de la vue, republication des info d'objets), effacement
   des présences offline après `staleClientDelay`. `hla-robustness-test` 13/13, suite verte.
+- **Propriété, issues #13 à #20** (2026-11-25) : plusieurs propriétaires par instance, un enregistrement
+  retained par propriétaire (`F/owners/<instance>/<fédéré>`), `info` immuable ; messages JSON
+  `F/ownership/<fédéré>` et `.../all` ; revendication des attributs sans propriétaire par marqueur
+  (barrière). Tous les services et callbacks du chapitre 7, resign complet (`MqttOwnership.cpp`).
+  `hla-ownership-test` 63/63 (9 exécutions, Release et Debug), suite complète verte (9/9).
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 
@@ -147,4 +156,4 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 1. `check_imports.py` sur un vrai fédéré (selftest Windows validé).
 2. Compiler et tester l'encodage sous Linux/GCC.
 3. Tester la substitution de DLL sur un vrai fédéré dès qu'un exécutable est disponible.
-4. Propriété, sauvegarde/restauration.
+4. Sauvegarde/restauration.

@@ -3,11 +3,12 @@
 //
 // Topics under the joined federation F (class path = qualified name, one
 // topic level per component, e.g. HLAobjectRoot/Vehicle/Car):
-//   F/objects/<class path>/@<instance>/info     retained JSON {"instance","class","name","owner","clientId"}
+//   F/objects/<class path>/@<instance>/info     retained JSON {"instance","class","name","registrant","clientId"}
+//                                               (immutable; ownership: F/owners/..., see MqttOwnership.cpp)
 //   F/objects/<class path>/@<instance>/update   binary Update
 //   F/objects/<class path>/@<instance>/delete   binary Delete (then info is cleared)
 //   F/interactions/<class path>/@               binary Interaction
-//   F/requests/<owner federate handle>          binary Request for one instance
+//   F/requests/<owner federate handle>          binary Request for one instance (one per owner)
 //   F/classrequests/<class path>/@              binary Request for a class
 //
 // Subscribing to a class subscribes to "<class path>/#" on the broker, which
@@ -17,13 +18,14 @@
 // overlapping subscriptions can still produce while the cover changes.
 //
 // Discovery comes from the retained info record (objects registered before the
-// subscription included). An object whose owner is no longer present (Last
-// Will) is removed, as the automatic resign of a crashed federate would do.
+// subscription included). An object whose delete privilege holder is no longer
+// present (Last Will) is removed, as the automatic resign of a crashed federate
+// would do.
 //
 // Time-stamped variants are accepted and delivered in receive order with their
 // time (the sender cannot be time-regulating before time management exists).
 // Ownership: the registering federate owns the attributes it publishes at
-// registration, and HLAprivilegeToDeleteObject.
+// registration, and HLAprivilegeToDeleteObject; transfers in MqttOwnership.cpp.
 
 #include "MqttRTIambassador.h"
 
@@ -156,14 +158,19 @@ void MqttRTIambassador::subscribeJoinedTopics()
    _transport->subscribe(ft + "/federates/+");
    _transport->subscribe(ft + "/requests/" + hex64(_federateHandle));
    _transport->subscribe(ft + "/classrequests/#");
+   _transport->subscribe(ft + "/owners/#");
+   _transport->subscribe(ft + "/ownership/" + hex64(_federateHandle));
+   _transport->subscribe(ft + "/ownership/all");
 }
 
 void MqttRTIambassador::unsubscribeJoinedTopics() noexcept
 {
    std::string const ft = _fedTopic;
-   for (char const* t : {"/execution", "/fom/+", "/federates/+", "/classrequests/#", "/sync/#", "/time/+", "/decl/+"})
+   for (char const* t : {"/execution", "/fom/+", "/federates/+", "/classrequests/#", "/sync/#", "/time/+", "/decl/+",
+                         "/owners/#", "/ownership/all"})
       _transport->unsubscribe(ft + t);
    _transport->unsubscribe(ft + "/requests/" + hex64(_federateHandle));
+   _transport->unsubscribe(ft + "/ownership/" + hex64(_federateHandle));
    for (std::string const& t : _coverTopics)
       _transport->unsubscribe(t);
    _coverTopics.clear();
@@ -172,6 +179,8 @@ void MqttRTIambassador::unsubscribeJoinedTopics() noexcept
 void MqttRTIambassador::resetObjectState()
 {
    _objects.clear();
+   _ownerRecords.clear();
+   _pendingMarks.clear();
    _publishedAttributes.clear();
    _subscribedAttributes.clear();
    _publishedInteractions.clear();
@@ -247,7 +256,7 @@ void MqttRTIambassador::updateBrokerSubscriptions()
 // ============================================================ incoming traffic
 void MqttRTIambassador::tryDiscover(ObjectInstance& o)
 {
-   if (o.knownClass != 0 || o.owner == _federateHandle)
+   if (o.knownClass != 0 || staleObject(o.handle))
       return;
    std::uint64_t const k = knownObjectClass(o.objectClass);
    if (k == 0)
@@ -268,7 +277,7 @@ void MqttRTIambassador::discoverPending()
          tryDiscover(kv.second);
 }
 
-void MqttRTIambassador::handlePresence(std::string const& clientId, std::string const& payload)
+bool MqttRTIambassador::handlePresence(std::string const& clientId, std::string const& payload)
 {
    bool online = false;
    if (!payload.empty())
@@ -284,26 +293,9 @@ void MqttRTIambassador::handlePresence(std::string const& clientId, std::string 
    // Only the transition online -> offline/absent counts (a Last Will, then the
    // removal of the stale presence, must not report the loss twice).
    if (online || !clientAlive(clientId) || clientId == _transport->settings().clientId)
-      return;
+      return false;
    momFederateLost(clientId); // HLAreportFederateLost, before the records go
-   for (auto it = _objects.begin(); it != _objects.end();)
-   {
-      ObjectInstance const& o = it->second;
-      if (o.owner != 0 && o.owner != _federateHandle && o.ownerClient == clientId)
-      {
-         if (o.knownClass != 0)
-         {
-            ++_momRemoved;
-            ObjectInstanceHandle const instance = ObjectInstanceHandleFriend::create(o.handle);
-            enqueue([instance](FederateAmbassador& fa) {
-               fa.removeObjectInstance(instance, VariableLengthData(), RECEIVE, SupplementalRemoveInfo());
-            });
-         }
-         it = _objects.erase(it);
-      }
-      else
-         ++it;
-   }
+   return true; // then ownershipPresenceLost, once the presence is recorded offline
 }
 
 void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string const& payload)
@@ -318,7 +310,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          if (payload.empty()) // info cleared: deleted (normally after a delete message)
          {
             auto it = _objects.find(instance);
-            if (it != _objects.end() && it->second.owner != _federateHandle)
+            if (it != _objects.end() && !it->second.mom && !it->second.owned.count(privilegeAttribute()))
             {
                if (it->second.knownClass != 0)
                {
@@ -337,32 +329,18 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          o.handle = parseHex(j["instance"].str());
          o.objectClass = parseHex(j["class"].str());
          o.name = j["name"].str();
-         o.owner = parseHex(j["owner"].str());
-         o.ownerClient = j["clientId"].str();
-         for (std::string const& a : j["owned"].strings())
-            o.ownedRemote.insert(parseHex(a));
-         for (auto const& kv : j["transport"].members())
-            o.transport[parseHex(kv.first)] = kv.second.str();
-         for (auto const& kv : j["regions"].members())
-            for (Json const& e : kv.second.items())
-               o.remoteRegions[parseHex(kv.first)].push_back(extentsFromJson(e));
+         o.registrant = parseHex(j["registrant"].str());
          o.topic = _fedTopic + "/" + rest.substr(0, rest.size() - 5);
-         if (o.owner == _federateHandle || !_fdd->objectClass(o.objectClass))
+         if (!_fdd->objectClass(o.objectClass))
             return;
-         if (o.owner != 0 && !clientAlive(o.ownerClient))
-            return; // stale record of a vanished federate
          auto it = _objects.find(o.handle);
+         if (it != _objects.end() && it->second.mom)
+            return; // our own HLAfederate
          if (it == _objects.end())
-            it = _objects.emplace(o.handle, o).first;
-         else
          {
-            it->second.owner = o.owner; // ownership change (divestiture)
-            it->second.ownerClient = o.ownerClient;
-            it->second.ownedRemote = o.ownedRemote;
-            it->second.transport = o.transport;
-            it->second.remoteRegions = o.remoteRegions;
-            if (it->second.knownClass != 0)
-               evaluateScope(it->second); // update regions may have moved
+            if (o.registrant == _federateHandle || staleObject(o.handle))
+               return; // ours (already deleted), or stale record of a vanished federate
+            it = _objects.emplace(o.handle, o).first;
          }
          if (!it->second.locallyDeleted)
             tryDiscover(it->second);
@@ -550,7 +528,7 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          for (auto const& kv : _objects)
          {
             ObjectInstance const& o = kv.second;
-            if (o.owner != _federateHandle)
+            if (o.owned.empty())
                continue;
             if (instance != 0 ? o.handle != instance : !isSubclassOf(o.objectClass, cls))
                continue;
@@ -927,6 +905,7 @@ ObjectInstanceHandle MqttRTIambassador::registerObject(ObjectClassHandle theClas
 {
    ObjectInstance o;
    std::string infoPayload;
+   std::pair<std::string, std::string> record;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
@@ -950,15 +929,16 @@ ObjectInstanceHandle MqttRTIambassador::registerObject(ObjectClassHandle theClas
          if (!_reservedNames.count(theObjectInstanceName))
             throw ObjectInstanceNameNotReserved(theObjectInstanceName);
          for (auto const& kv : _objects)
-            if (kv.second.owner == _federateHandle && kv.second.name == toUtf8(theObjectInstanceName))
+            if (kv.second.registered && kv.second.name == toUtf8(theObjectInstanceName))
                throw ObjectInstanceNameInUse(theObjectInstanceName);
          o.name = toUtf8(theObjectInstanceName);
       }
       else
          o.name = "HLAobject-" + hex64(o.handle);
       o.objectClass = theClassValue;
-      o.owner = _federateHandle;
-      o.ownerClient = _transport->settings().clientId;
+      o.knownClass = theClassValue;
+      o.registered = true;
+      o.registrant = _federateHandle;
       o.topic = _fedTopic + "/objects/" + classTopicPath(_fdd->objectClass(theClassValue)->qualified) + "/@" +
                 hex64(o.handle);
       o.owned = pub->second;
@@ -970,12 +950,15 @@ ObjectInstanceHandle MqttRTIambassador::registerObject(ObjectClassHandle theClas
                for (RegionHandle const& r : pair.second)
                   o.updateRegions[av].insert(RegionHandleFriend::value(r));
             });
+      o.recordsInFlight = 1;
       _objects[o.handle] = o;
+      record = ownerRecordEntry(o);
       infoPayload = objectInfo(o);
       evaluateAdvisories();
    }
    try
    {
+      _transport->publish(record.first, record.second, 1, true); // owner first: never seen unowned
       _transport->publish(o.topic + "/info", infoPayload, 1, true);
    }
    catch (std::runtime_error const& e)
@@ -1024,7 +1007,7 @@ void MqttRTIambassador::updateAttributeValues(ObjectInstanceHandle theObject,
          std::uint64_t const a = AttributeHandleFriend::value(kv.first);
          if (!_fdd->classHasAttribute(o.objectClass, a))
             throw AttributeNotDefined(kv.first.toString());
-         if (o.owner != _federateHandle || !o.owned.count(a))
+         if (!o.owned.count(a))
             throw AttributeNotOwned(kv.first.toString());
          if (!bestEffort(o, a))
             qos = 1;
@@ -1065,7 +1048,7 @@ MessageRetractionHandle MqttRTIambassador::updateAttributeValues(ObjectInstanceH
       std::uint64_t const a = AttributeHandleFriend::value(kv.first);
       if (!_fdd->classHasAttribute(o.objectClass, a))
          throw AttributeNotDefined(kv.first.toString());
-      if (o.owner != _federateHandle || !o.owned.count(a))
+      if (!o.owned.count(a))
          throw AttributeNotOwned(kv.first.toString());
       int const k = (_time.regulating && timestampOrder(o, a)) ? 1 : 0;
       parts[k][kv.first] = kv.second;
@@ -1184,8 +1167,8 @@ MessageRetractionHandle MqttRTIambassador::sendInteractionMessage(InteractionCla
 }
 
 // 6.14
-void MqttRTIambassador::deleteOwnObject(ObjectInstance const& o, VariableLengthData const& tag, std::string const& time,
-                                        bool tso)
+void MqttRTIambassador::deleteOwnObject(ObjectInstance const& o, std::vector<std::string> const& records,
+                                        VariableLengthData const& tag, std::string const& time, bool tso)
 {
    WireWriter w(WireKind::Delete);
    w.u64(_federateHandle).u64(nextSeq()).u64(o.handle).bytes(tag.data(), tag.size());
@@ -1195,6 +1178,8 @@ void MqttRTIambassador::deleteOwnObject(ObjectInstance const& o, VariableLengthD
       w.u8(tso ? 2 : 1).bytes(time.data(), time.size());
    _transport->publish(o.topic + "/delete", w.str(), 1, false);
    _transport->publish(o.topic + "/info", std::string(), 1, true);
+   for (std::string const& r : records) // co-owners not subscribed to the class learn the deletion here
+      _transport->publish(r, std::string(), 1, true);
 }
 
 void MqttRTIambassador::deleteObjectInstance(ObjectInstanceHandle theObject, VariableLengthData const& theUserSuppliedTag)
@@ -1202,20 +1187,23 @@ void MqttRTIambassador::deleteObjectInstance(ObjectInstanceHandle theObject, Var
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
    ObjectInstance o;
+   std::vector<std::string> records;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
-      if (it == _objects.end())
+      if (it == _objects.end() || it->second.knownClass == 0)
          throw ObjectInstanceNotKnown(theObject.toString());
-      if (it->second.owner != _federateHandle)
+      if (!it->second.owned.count(privilegeAttribute()))
          throw DeletePrivilegeNotHeld(theObject.toString());
       o = it->second;
+      records = recordTopicsOf(o.handle);
       _objects.erase(it);
+      _ownerRecords.erase(o.handle);
       ++_momDeleted;
    }
    try
    {
-      deleteOwnObject(o, theUserSuppliedTag, std::string());
+      deleteOwnObject(o, records, theUserSuppliedTag, std::string());
    }
    catch (std::runtime_error const& e)
    {
@@ -1231,23 +1219,26 @@ MessageRetractionHandle MqttRTIambassador::deleteObjectInstance(ObjectInstanceHa
    checkJoined();
    std::string const time = encodeTime(theTime);
    ObjectInstance o;
+   std::vector<std::string> records;
    bool tso = false;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
-      if (it == _objects.end())
+      if (it == _objects.end() || it->second.knownClass == 0)
          throw ObjectInstanceNotKnown(theObject.toString());
-      if (it->second.owner != _federateHandle)
+      std::uint64_t const priv = privilegeAttribute();
+      if (!it->second.owned.count(priv))
          throw DeletePrivilegeNotHeld(theObject.toString());
-      Fdd::Attribute const* priv = _fdd->findAttribute(it->second.objectClass, "HLAprivilegeToDeleteObject");
-      tso = sendsTso(priv && timestampOrder(it->second, priv->handle), TimeValue::of(theTime, timeIsInteger()));
+      tso = sendsTso(timestampOrder(it->second, priv), TimeValue::of(theTime, timeIsInteger()));
       o = it->second;
+      records = recordTopicsOf(o.handle);
       _objects.erase(it);
+      _ownerRecords.erase(o.handle);
       ++_momDeleted;
    }
    try
    {
-      deleteOwnObject(o, theUserSuppliedTag, time, tso);
+      deleteOwnObject(o, records, theUserSuppliedTag, time, tso);
    }
    catch (std::runtime_error const& e)
    {
@@ -1263,9 +1254,9 @@ void MqttRTIambassador::localDeleteObjectInstance(ObjectInstanceHandle theObject
    checkJoined();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
-   if (it == _objects.end() || (it->second.knownClass == 0 && it->second.owner != _federateHandle))
+   if (it == _objects.end() || it->second.knownClass == 0)
       throw ObjectInstanceNotKnown(theObject.toString());
-   if (it->second.owner == _federateHandle)
+   if (!it->second.owned.empty())
       throw FederateOwnsAttributes(theObject.toString());
    it->second.knownClass = 0;
    it->second.locallyDeleted = true;
@@ -1279,15 +1270,14 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectInstanceHandle theObje
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
-   std::uint64_t owner = 0;
+   std::map<std::uint64_t, std::vector<std::uint64_t>> byOwner; // the owners other than us
    std::uint64_t cls = 0;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
-      if (it == _objects.end() || (it->second.knownClass == 0 && it->second.owner != _federateHandle))
+      if (it == _objects.end() || it->second.knownClass == 0)
          throw ObjectInstanceNotKnown(theObject.toString());
       cls = it->second.objectClass;
-      owner = it->second.owner;
       HLA_MQTT_CHECK_ATTRIBUTES(cls, theAttributes)
       if (it->second.mom) // our HLAfederate or the HLAfederation object
       {
@@ -1297,15 +1287,22 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectInstanceHandle theObje
          momProvide(it->second, attrs);
          return;
       }
+      for (AttributeHandle const& a : theAttributes)
+      {
+         std::uint64_t const owner = ownerOf(it->second, AttributeHandleFriend::value(a));
+         if (owner != 0 && owner != _federateHandle) // unowned, or owned by the requester: nothing to provide
+            byOwner[owner].push_back(AttributeHandleFriend::value(a));
+      }
    }
-   if (owner == 0 || owner == _federateHandle)
-      return; // no owner, or attributes owned by the requester: nothing to provide
-   WireWriter w(WireKind::Request);
-   w.u64(_federateHandle).u64(nextSeq()).u64(ObjectInstanceHandleFriend::value(theObject)).u64(cls);
-   w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u32(std::uint32_t(theAttributes.size()));
-   for (AttributeHandle const& a : theAttributes)
-      w.u64(AttributeHandleFriend::value(a));
-   sendUpdate(*_transport, _fedTopic + "/requests/" + hex64(owner), w, 1);
+   for (auto const& kv : byOwner)
+   {
+      WireWriter w(WireKind::Request);
+      w.u64(_federateHandle).u64(nextSeq()).u64(ObjectInstanceHandleFriend::value(theObject)).u64(cls);
+      w.bytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()).u32(std::uint32_t(kv.second.size()));
+      for (std::uint64_t a : kv.second)
+         w.u64(a);
+      sendUpdate(*_transport, _fedTopic + "/requests/" + hex64(kv.first), w, 1);
+   }
 }
 
 void MqttRTIambassador::requestAttributeValueUpdate(ObjectClassHandle theClass, AttributeHandleSet const& theAttributes,
@@ -1367,36 +1364,71 @@ void MqttRTIambassador::requestClassUpdate(ObjectClassHandle theClass, Attribute
 }
 
 // ============================================================= resign
+// 4.10 resign actions: cancel the pending acquisitions, delete the objects we
+// hold the delete privilege of, divest the remaining attributes (to a pending
+// acquisition if any, otherwise unowned). Validated before any effect.
 void MqttRTIambassador::resignObjects(ResignAction action)
 {
-   std::vector<ObjectInstance> own;
+   bool const cancel = action == CANCEL_PENDING_OWNERSHIP_ACQUISITIONS || action == CANCEL_THEN_DELETE_THEN_DIVEST;
+   bool const remove =
+      action == DELETE_OBJECTS || action == DELETE_OBJECTS_THEN_DIVEST || action == CANCEL_THEN_DELETE_THEN_DIVEST;
+   bool const divestAll = action == UNCONDITIONALLY_DIVEST_ATTRIBUTES || action == DELETE_OBJECTS_THEN_DIVEST ||
+                          action == CANCEL_THEN_DELETE_THEN_DIVEST;
+   std::vector<std::pair<ObjectInstance, std::vector<std::string>>> deleted;
    std::set<std::wstring> names;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
+      std::uint64_t const priv = privilegeAttribute();
+      size_t owning = 0;
+      bool pending = false;
       for (auto const& kv : _objects)
-         if (kv.second.owner == _federateHandle)
-            own.push_back(kv.second);
+      {
+         ObjectInstance const& o = kv.second;
+         if (o.mom)
+            continue;
+         pending = pending || !o.acquiring.empty();
+         if (!o.owned.empty() && !(remove && o.owned.count(priv)))
+            ++owning;
+      }
+      if (pending && !cancel)
+         throw OwnershipAcquisitionPending(L"the federate has pending attribute ownership acquisitions");
+      if (owning != 0 && !divestAll)
+         throw FederateOwnsAttributes(L"the federate still owns attributes of " + std::to_wstring(owning) +
+                                      L" object instance(s)");
+      for (auto it = _objects.begin(); it != _objects.end();)
+      {
+         ObjectInstance& o = it->second;
+         if (o.mom)
+         {
+            ++it;
+            continue;
+         }
+         if (cancel && !o.acquiring.empty())
+         {
+            std::set<std::uint64_t> attrs;
+            for (auto const& acq : o.acquiring)
+               attrs.insert(acq.first);
+            cancelAcquisitions(o, attrs, false);
+         }
+         if (remove && o.owned.count(priv))
+         {
+            deleted.emplace_back(o, recordTopicsOf(o.handle));
+            _ownerRecords.erase(o.handle);
+            it = _objects.erase(it);
+            ++_momDeleted;
+            continue;
+         }
+         if (divestAll && !o.owned.empty())
+         {
+            std::set<std::uint64_t> const attrs = o.owned;
+            divest(o, attrs);
+         }
+         ++it;
+      }
       names = _reservedNames;
    }
-   if (!own.empty() && (action == NO_ACTION || action == CANCEL_PENDING_OWNERSHIP_ACQUISITIONS))
-      throw FederateOwnsAttributes(L"the federate still owns attributes of " + std::to_wstring(own.size()) +
-                                   L" object instance(s)");
-   for (ObjectInstance const& o : own)
-   {
-      if (action == UNCONDITIONALLY_DIVEST_ATTRIBUTES)
-      {
-         // The object stays in the federation, without owner.
-         Json info = Json::object();
-         info.set("instance", hex64(o.handle));
-         info.set("class", hex64(o.objectClass));
-         info.set("name", o.name);
-         info.set("owner", hex64(0));
-         info.set("clientId", "");
-         _transport->publish(o.topic + "/info", info.dump(), 1, true);
-      }
-      else
-         deleteOwnObject(o, VariableLengthData(), std::string());
-   }
+   for (auto const& d : deleted)
+      deleteOwnObject(d.first, d.second, VariableLengthData(), std::string());
    std::string const myId = encodeTopicLevel(_transport->settings().clientId);
    for (std::wstring const& n : names)
       _transport->publish(_fedTopic + "/names/" + encodeTopicLevel(toUtf8(n)) + "/" + myId, std::string(), 1, true);
@@ -1408,13 +1440,8 @@ ObjectClassHandle MqttRTIambassador::getKnownObjectClassHandle(ObjectInstanceHan
    checkJoined();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
-   if (it != _objects.end())
-   {
-      if (it->second.owner == _federateHandle)
-         return ObjectClassHandleFriend::create(it->second.objectClass);
-      if (it->second.knownClass != 0)
-         return ObjectClassHandleFriend::create(it->second.knownClass);
-   }
+   if (it != _objects.end() && it->second.knownClass != 0)
+      return ObjectClassHandleFriend::create(it->second.knownClass);
    throw ObjectInstanceNotKnown(theObject.toString());
 }
 
@@ -1424,7 +1451,7 @@ ObjectInstanceHandle MqttRTIambassador::getObjectInstanceHandle(std::wstring con
    std::string const name = toUtf8(theName);
    std::lock_guard<std::mutex> v(_viewMutex);
    for (auto const& kv : _objects)
-      if (kv.second.name == name && (kv.second.owner == _federateHandle || kv.second.knownClass != 0))
+      if (kv.second.name == name && kv.second.knownClass != 0)
          return ObjectInstanceHandleFriend::create(kv.first);
    throw ObjectInstanceNotKnown(theName);
 }
@@ -1434,7 +1461,7 @@ std::wstring MqttRTIambassador::getObjectInstanceName(ObjectInstanceHandle theHa
    checkJoined();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _objects.find(ObjectInstanceHandleFriend::value(theHandle));
-   if (it != _objects.end() && (it->second.owner == _federateHandle || it->second.knownClass != 0))
+   if (it != _objects.end() && it->second.knownClass != 0)
       return fromUtf8(it->second.name);
    throw ObjectInstanceNotKnown(theHandle.toString());
 }

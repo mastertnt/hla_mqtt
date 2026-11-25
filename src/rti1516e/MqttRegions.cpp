@@ -139,28 +139,8 @@ std::string MqttRTIambassador::objectInfo(ObjectInstance const& o) const
    info.set("instance", hex64(o.handle));
    info.set("class", hex64(o.objectClass));
    info.set("name", o.name);
-   info.set("owner", hex64(o.owner));
-   info.set("clientId", o.ownerClient);
-   Json owned = Json::array();
-   for (std::uint64_t a : o.owned)
-      owned.push(hex64(a));
-   info.set("owned", owned);
-   Json transport = Json::object();
-   for (auto const& kv : o.transport)
-      transport.set(hex64(kv.first), kv.second);
-   if (!transport.members().empty())
-      info.set("transport", transport);
-   Json regions = Json::object();
-   for (auto const& attr : o.updateRegions)
-   {
-      Json list = Json::array();
-      for (Extents const& e : ownExtents(attr.second))
-         list.push(extentsToJson(e));
-      if (!list.items().empty())
-         regions.set(hex64(attr.first), list);
-   }
-   if (!regions.members().empty())
-      info.set("regions", regions);
+   info.set("registrant", hex64(o.registrant));
+   info.set("clientId", _transport->settings().clientId); // of the publisher
    return info.dump();
 }
 
@@ -178,13 +158,17 @@ std::vector<Extents> MqttRTIambassador::ownExtents(std::set<std::uint64_t> const
 
 std::vector<Extents> MqttRTIambassador::updateExtents(ObjectInstance const& o, std::uint64_t attribute) const
 {
-   if (o.owner == _federateHandle)
+   if (o.owned.count(attribute))
    {
       auto it = o.updateRegions.find(attribute);
       return it == o.updateRegions.end() ? std::vector<Extents>() : ownExtents(it->second);
    }
-   auto it = o.remoteRegions.find(attribute);
-   return it == o.remoteRegions.end() ? std::vector<Extents>() : it->second;
+   std::uint64_t const owner = ownerOf(o, attribute); // the owner's record
+   OwnerRecord const* r = owner != 0 ? liveRecord(o.handle, owner) : nullptr;
+   if (!r)
+      return std::vector<Extents>();
+   auto it = r->regions.find(attribute);
+   return it == r->regions.end() ? std::vector<Extents>() : it->second;
 }
 
 bool MqttRTIambassador::subscriptionCovers(std::uint64_t cls, std::uint64_t attribute,
@@ -213,20 +197,23 @@ bool MqttRTIambassador::interactionCovers(std::uint64_t cls, std::vector<Extents
 }
 
 std::vector<std::pair<std::string, std::string>> MqttRTIambassador::infoRecordsUsing(
-   std::set<std::uint64_t> const& regions) const
+   std::set<std::uint64_t> const& regions)
 {
    std::vector<std::pair<std::string, std::string>> records;
-   for (auto const& kv : _objects)
+   for (auto& kv : _objects)
    {
-      ObjectInstance const& o = kv.second;
-      if (o.owner != _federateHandle)
+      ObjectInstance& o = kv.second;
+      if (o.owned.empty() || o.mom)
          continue;
       bool uses = false;
       for (auto const& attr : o.updateRegions)
          for (std::uint64_t r : attr.second)
-            uses = uses || regions.count(r) != 0;
+            uses = uses || (regions.count(r) != 0 && o.owned.count(attr.first) != 0);
       if (uses)
-         records.emplace_back(o.topic + "/info", objectInfo(o));
+      {
+         records.push_back(ownerRecordEntry(o));
+         ++o.recordsInFlight;
+      }
    }
    return records;
 }
@@ -321,7 +308,8 @@ std::uint64_t knownClassOf(Objects const& objects, std::uint64_t instance, std::
    auto it = objects.find(instance);
    if (it == objects.end())
       return 0;
-   return it->second.owner == self ? it->second.objectClass : it->second.knownClass;
+   (void)self;
+   return it->second.knownClass;
 }
 } // namespace
 
@@ -344,8 +332,11 @@ void MqttRTIambassador::associateRegionsForUpdates(
             for (RegionHandle const& r : pair.second)
                o.updateRegions[av].insert(RegionHandleFriend::value(r));
          });
-      if (o.owner == _federateHandle)
-         records.emplace_back(o.topic + "/info", objectInfo(o));
+      if (!o.owned.empty() && !o.mom)
+      {
+         records.push_back(ownerRecordEntry(o));
+         ++o.recordsInFlight;
+      }
       evaluateAdvisories();
    }
    publishInfoRecords(records);
@@ -375,8 +366,11 @@ void MqttRTIambassador::unassociateRegionsForUpdates(
             if (it->second.empty())
                o.updateRegions.erase(it);
          });
-      if (o.owner == _federateHandle)
-         records.emplace_back(o.topic + "/info", objectInfo(o));
+      if (!o.owned.empty() && !o.mom)
+      {
+         records.push_back(ownerRecordEntry(o));
+         ++o.recordsInFlight;
+      }
       evaluateAdvisories();
    }
    publishInfoRecords(records);

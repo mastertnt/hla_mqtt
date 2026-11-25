@@ -145,6 +145,21 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
          handleObjectTraffic(rest, payload);
          return;
       }
+      if (startsWith(rest, "ownership/"))
+      {
+         handleOwnershipTraffic(rest, payload);
+         return;
+      }
+      if (startsWith(rest, "owners/"))
+      {
+         // Mirrored: the resynchronization after a reconnection sees the records gone.
+         if (payload.empty())
+            _view.erase(topic);
+         else
+            _view[topic] = payload;
+         handleOwnershipTraffic(rest, payload);
+         return;
+      }
       if (startsWith(rest, "decl/"))
       {
          handleDeclarations(rest.substr(5), payload);
@@ -158,16 +173,19 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
    }
    // Presence change while joined: objects of a vanished federate are removed.
    // (_fdd is only set while joined, hence while _transport exists.)
+   std::string lostClient;
    if (_fdd && _transport)
    {
       std::string const presencePrefix = _transport->settings().topicPrefix + "/clients/";
-      if (startsWith(topic, presencePrefix))
-         handlePresence(topic.substr(presencePrefix.size()), payload);
+      if (startsWith(topic, presencePrefix) && handlePresence(topic.substr(presencePrefix.size()), payload))
+         lostClient = topic.substr(presencePrefix.size());
    }
    if (payload.empty())
       _view.erase(topic);
    else
       _view[topic] = payload;
+   if (!lostClient.empty())
+      ownershipPresenceLost(lostClient); // presence now offline: its records are dead
 
    if (_fdd && !_fedTopic.empty() && startsWith(topic, _fedTopic + "/"))
    {

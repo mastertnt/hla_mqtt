@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <tuple>
 #include <cstdlib>
 #include <cstdio>
 
@@ -327,6 +328,8 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
       _momFederateObject = _momFederationObject = 0;
       _momInfoTopic.clear();
       _momInfoPayload.clear();
+      _momRecordTopic.clear();
+      _momRecordPayload.clear();
 
       if (Fdd::ObjectClass const* c = _fdd->objectClassByName(kFederateClass))
       {
@@ -334,14 +337,14 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
          o.handle = newUniqueValue("O");
          o.objectClass = c->handle;
          o.name = "HLAfederate." + toUtf8(_federateName);
-         o.mom = true; // owner 0 here: the RTI, not the federate, owns it
+         o.mom = true; // no attribute owned here: the RTI, not the federate, owns it
+         o.registered = true;
+         o.registrant = _federateHandle;
          o.topic = _fedTopic + "/objects/" + classTopicPath(c->qualified) + "/@" + hex64(o.handle);
          _objects[o.handle] = o;
          _momFederateObject = o.handle;
-         // Info record as seen by the others: owned by this federate.
+         // Owner record as seen by the others: owned by this federate.
          ObjectInstance published = o;
-         published.owner = _federateHandle;
-         published.ownerClient = _transport->settings().clientId;
          for (std::uint64_t k = c->handle; k != 0; k = _fdd->objectClass(k)->parent)
             for (std::uint64_t a : _fdd->objectClass(k)->attributes)
                published.owned.insert(a);
@@ -349,6 +352,7 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
          infoPayload = objectInfo(published);
          _momInfoTopic = infoTopic;
          _momInfoPayload = infoPayload;
+         std::tie(_momRecordTopic, _momRecordPayload) = ownerRecordEntry(published);
       }
       if (Fdd::ObjectClass const* c = _fdd->objectClassByName(kFederationClass))
       {
@@ -362,7 +366,10 @@ void MqttRTIambassador::momJoined(std::vector<std::wstring> const& designators, 
       }
    }
    if (!infoTopic.empty())
+   {
+      _transport->publish(_momRecordTopic, _momRecordPayload, 1, true);
       _transport->publish(infoTopic, infoPayload, 1, true);
+   }
    momStopThread(); // left running by a lost connection
    {
       std::lock_guard<std::mutex> lock(_momThreadMutex);
@@ -389,6 +396,7 @@ void MqttRTIambassador::momResigning()
 {
    momStopThread();
    ObjectInstance o;
+   std::vector<std::string> records;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       auto it = _objects.find(_momFederateObject);
@@ -397,10 +405,12 @@ void MqttRTIambassador::momResigning()
       o = it->second;
       _objects.erase(it);
       _momFederateObject = 0;
+      records.push_back(_momRecordTopic);
+      _momRecordTopic.clear();
    }
    try
    {
-      deleteOwnObject(o, VariableLengthData(), std::string());
+      deleteOwnObject(o, records, VariableLengthData(), std::string());
    }
    catch (std::runtime_error const&)
    {
@@ -515,14 +525,13 @@ std::map<std::string, VariableLengthData> MqttRTIambassador::momFederateValues()
    for (auto const& kv : _objects)
    {
       ObjectInstance const& o = kv.second;
-      if (o.owner == _federateHandle)
-      {
+      if (o.mom)
+         continue;
+      if (o.owned.count(privilegeAttribute()))
+         ++deletable;
+      if (o.registered)
          ++registered;
-         Fdd::Attribute const* priv = _fdd->findAttribute(o.objectClass, "HLAprivilegeToDeleteObject");
-         if (priv && o.owned.count(priv->handle))
-            ++deletable;
-      }
-      else if (o.knownClass != 0 && !o.mom)
+      else if (o.knownClass != 0)
          ++discovered;
    }
    for (auto const& kv : _momInstancesUpdated)
@@ -947,8 +956,7 @@ void MqttRTIambassador::momFederateRequest(std::string const& name, std::uint64_
       std::map<std::uint64_t, std::set<std::uint64_t>> deletable;
       for (auto const& kv : _objects)
       {
-         Fdd::Attribute const* priv = _fdd->findAttribute(kv.second.objectClass, "HLAprivilegeToDeleteObject");
-         if (kv.second.owner == _federateHandle && priv && kv.second.owned.count(priv->handle))
+         if (!kv.second.mom && kv.second.owned.count(privilegeAttribute()))
             deletable[kv.second.objectClass].insert(kv.first);
       }
       momSendFederate("HLAreportObjectInstancesThatCanBeDeleted",
@@ -972,17 +980,15 @@ void MqttRTIambassador::momFederateRequest(std::string const& name, std::uint64_
    {
       std::uint64_t const instance = decHandle(p("HLAobjectInstance"));
       auto it = _objects.find(instance);
-      if (it == _objects.end() || (it->second.owner != _federateHandle && it->second.knownClass == 0))
+      if (it == _objects.end() || it->second.knownClass == 0)
          throw MomParameterError{L"object instance not known by the federate"};
       ObjectInstance const& o = it->second;
-      std::vector<std::uint64_t> owned;
-      if (o.owner == _federateHandle)
-         owned.assign(o.owned.begin(), o.owned.end());
+      std::vector<std::uint64_t> const owned(o.owned.begin(), o.owned.end());
       momSendFederate("HLAreportObjectInstanceInformation",
                       {{"HLAobjectInstance", encHandle(instance)},
                        {"HLAownedInstanceAttributeList", encHandleList(owned)},
                        {"HLAregisteredClass", encHandle(o.objectClass)},
-                       {"HLAknownClass", encHandle(o.owner == _federateHandle ? o.objectClass : o.knownClass)}});
+                       {"HLAknownClass", encHandle(o.knownClass)}});
    }
    else if (name == "HLArequestFOMmoduleData")
    {
@@ -1099,7 +1105,7 @@ void MqttRTIambassador::momAdjust(std::string const& name, std::uint64_t cls,
          _conveyProducingFederate = decInt(p("HLAconveyProducingFederate")) == 1;
    }
    else if (name == "HLAmodifyAttributeState")
-      momException(L"HLAmodifyAttributeState", L"ownership management is not implemented by this RTI", false);
+      momException(L"HLAmodifyAttributeState", L"HLAmodifyAttributeState is not implemented by this RTI", false);
    else
       throw MomParameterError{L"adjustment not handled by this RTI"};
 }

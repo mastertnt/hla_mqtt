@@ -22,6 +22,17 @@ OUT = ROOT / "src" / "rti1516e" / "generated"
 
 # RTIambassador services implemented by hand in MqttRTIambassador.cpp
 IMPLEMENTED = {
+    "unconditionalAttributeOwnershipDivestiture",
+    "negotiatedAttributeOwnershipDivestiture",
+    "confirmDivestiture",
+    "attributeOwnershipAcquisition",
+    "attributeOwnershipAcquisitionIfAvailable",
+    "attributeOwnershipReleaseDenied",
+    "attributeOwnershipDivestitureIfWanted",
+    "cancelNegotiatedAttributeOwnershipDivestiture",
+    "cancelAttributeOwnershipAcquisition",
+    "queryAttributeOwnership",
+    "isAttributeOwnedByFederate",
     "connect",
     "disconnect",
     "evokeCallback",

@@ -18,6 +18,8 @@
 #include "MqttTransport.h"
 #include "Utf.h"
 
+#include <tuple>
+
 namespace hla_mqtt
 {
 namespace
@@ -45,9 +47,19 @@ bool MqttRTIambassador::timestampOrder(ObjectInstance const& o, std::uint64_t at
 
 bool MqttRTIambassador::bestEffort(ObjectInstance const& o, std::uint64_t attribute) const
 {
-   auto it = o.transport.find(attribute);
-   if (it != o.transport.end())
-      return it->second == "HLAbestEffort";
+   std::map<std::uint64_t, std::string> const* changed = &o.transport; // ours, or the owner's record
+   if (!o.owned.count(attribute))
+   {
+      std::uint64_t const owner = ownerOf(o, attribute);
+      OwnerRecord const* r = owner != 0 ? liveRecord(o.handle, owner) : nullptr;
+      changed = r ? &r->transport : nullptr;
+   }
+   if (changed)
+   {
+      auto it = changed->find(attribute);
+      if (it != changed->end())
+         return it->second == "HLAbestEffort";
+   }
    Fdd::Attribute const* attr = _fdd->attribute(attribute);
    return attr && attr->transportation == "HLAbestEffort";
 }
@@ -96,13 +108,13 @@ namespace
 // Object known to the federate and the class it knows it by (registered class
 // for its own objects); throws ObjectInstanceNotKnown.
 template <class Objects>
-auto knownObject(Objects& objects, ObjectInstanceHandle const& h, std::uint64_t self, std::uint64_t& cls)
+auto knownObject(Objects& objects, ObjectInstanceHandle const& h, std::uint64_t /*self*/, std::uint64_t& cls)
    -> decltype(&objects.begin()->second)
 {
    auto it = objects.find(ObjectInstanceHandleFriend::value(h));
    if (it != objects.end())
    {
-      cls = it->second.owner == self ? it->second.objectClass : it->second.knownClass;
+      cls = it->second.knownClass;
       if (cls != 0)
          return &it->second;
    }
@@ -132,14 +144,14 @@ void MqttRTIambassador::requestAttributeTransportationTypeChange(ObjectInstanceH
          if (!_fdd->classHasAttribute(cls, AttributeHandleFriend::value(a)))
             throw AttributeNotDefined(a.toString());
       for (AttributeHandle const& a : theAttributes)
-         if (o->owner != _federateHandle || !o->owned.count(AttributeHandleFriend::value(a)))
+         if (!o->owned.count(AttributeHandleFriend::value(a)))
             throw AttributeNotOwned(a.toString());
       checkTransportation(theType);
       // The change is immediate: never AttributeAlreadyBeingChanged.
       for (AttributeHandle const& a : theAttributes)
          o->transport[AttributeHandleFriend::value(a)] = transportationName(theType);
-      topic = o->topic + "/info";
-      payload = objectInfo(*o);
+      std::tie(topic, payload) = ownerRecordEntry(*o); // seen by the subscribers
+      ++o->recordsInFlight;
    }
    try
    {
@@ -218,7 +230,7 @@ void MqttRTIambassador::changeAttributeOrderType(ObjectInstanceHandle theObject,
       if (!_fdd->classHasAttribute(cls, AttributeHandleFriend::value(a)))
          throw AttributeNotDefined(a.toString());
    for (AttributeHandle const& a : theAttributes)
-      if (o->owner != _federateHandle || !o->owned.count(AttributeHandleFriend::value(a)))
+      if (!o->owned.count(AttributeHandleFriend::value(a)))
          throw AttributeNotOwned(a.toString());
    if (theType != RECEIVE && theType != TIMESTAMP)
       throw RTIinternalError(L"invalid order type " + std::to_wstring(int(theType)));
@@ -251,8 +263,8 @@ double MqttRTIambassador::getUpdateRateValueForAttribute(ObjectInstanceHandle th
    std::uint64_t const a = AttributeHandleFriend::value(theAttribute);
    if (!_fdd->classHasAttribute(cls, a))
       throw AttributeNotDefined(theAttribute.toString());
-   if (o->owner == _federateHandle)
-      return 0; // not subscribed by its owner
+   if (o->owned.count(a))
+      return 0; // not reflected by its owner
    auto c = _subscribedRates.find(cls);
    if (c == _subscribedRates.end())
       return 0;

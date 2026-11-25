@@ -179,13 +179,20 @@ void MqttRTIambassador::onReconnected()
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       _resyncing = false;
+      // Our own owner records are published again below, not removals.
+      std::string const ownRecordSuffix = "/" + hex64(_federateHandle);
+      std::string const ownersPrefix = _fedTopic + "/owners/";
       for (auto const& kv : _view)
-         if (!_resyncSeen.count(kv.first))
+         if (!_resyncSeen.count(kv.first) &&
+             !(!_fedTopic.empty() && kv.first.compare(0, ownersPrefix.size(), ownersPrefix) == 0 &&
+               kv.first.size() > ownRecordSuffix.size() &&
+               kv.first.compare(kv.first.size() - ownRecordSuffix.size(), ownRecordSuffix.size(), ownRecordSuffix) == 0))
             vanished.push_back(kv.first);
+      std::uint64_t const priv = privilegeAttribute();
       for (auto const& kv : _objects)
       {
          ObjectInstance const& o = kv.second;
-         if (o.owner != _federateHandle && !o.mom && !o.topic.empty() && !_resyncSeen.count(o.topic + "/info"))
+         if (!o.owned.count(priv) && !o.mom && !o.topic.empty() && !_resyncSeen.count(o.topic + "/info"))
             vanished.push_back(o.topic + "/info");
       }
       _resyncSeen.clear();
@@ -219,14 +226,22 @@ void MqttRTIambassador::onReconnected()
       });
       return;
    }
-   for (auto const& kv : _objects)
+   std::uint64_t const priv = privilegeAttribute();
+   for (auto& kv : _objects)
    {
-      ObjectInstance const& o = kv.second;
-      if (o.owner == _federateHandle && !o.mom)
+      ObjectInstance& o = kv.second;
+      if (o.mom)
+         continue;
+      if (!o.owned.empty() || !o.claims.empty() || !o.given.empty())
+         publishOwnerRecord(o);
+      if (o.owned.count(priv))
          _transport->publishAsync(o.topic + "/info", objectInfo(o), 1, true);
    }
    if (!_momInfoTopic.empty())
+   {
+      _transport->publishAsync(_momRecordTopic, _momRecordPayload, 1, true);
       _transport->publishAsync(_momInfoTopic, _momInfoPayload, 1, true);
+   }
 }
 
 // ------------------------------------------------------ callback machinery

@@ -29,6 +29,7 @@ src/rti1516e/
   MqttFederation.cpp    gestion de fédération (protocole MQTT décrit plus bas)
   MqttSupportServices.cpp  services de support (noms, handles, dimensions, temps)
   MqttObjects.cpp       déclarations et objets ; Wire.h : format binaire des messages
+  MqttOwnership.cpp     gestion de la propriété (chapitre 7)
   MqttSync.cpp          points de synchronisation
   MqttTime.cpp          gestion du temps ; TimeValue.h : temps comparables, bornes
   Fdd.*                 FDD fusionné, handles déterministes ; Xml.*, Json.h : parseurs minimaux
@@ -44,6 +45,7 @@ tests/objects/          hla-objects-test : publish/subscribe, objets, interactio
 tests/time/             hla-time-test : points de synchronisation, gestion du temps
 tests/ddm/              hla-ddm-test : régions, associations, abonnements avec régions
 tests/mom/              hla-mom-test : MOM (objets HLAmanager, requêtes, rapports, services)
+tests/ownership/        hla-ownership-test : propriété (cessions, acquisitions concurrentes, resign)
 tests/robustness/       hla-robustness-test : reconnexion, présences périmées
 mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
@@ -192,7 +194,9 @@ Tous les topics sont retained, sauf `sync`. `F` est le nom de la fédération, e
 | `<prefix>/federations/F/federates/<handle>` | `{"name","type","handle","clientId","state":"joining"/"joined"}` |
 | `<prefix>/federations/F/claims/<clientId>` | réservation transitoire du nom pendant une création |
 | `<prefix>/federations/F/names/<nom>/<clientId>` | réservation d'un nom d'instance `{"clientId","federate","state":"reserving"/"reserved"}` |
-| `<prefix>/federations/F/objects/<chemin de classe>/@<instance>/info` | enregistrement de l'instance `{"instance","class","name","owner","clientId","owned","regions"}` |
+| `<prefix>/federations/F/objects/<chemin de classe>/@<instance>/info` | enregistrement immuable de l'instance `{"instance","class","name","registrant","clientId"}` |
+| `<prefix>/federations/F/owners/<instance>/<fédéré>` | propriété : attributs possédés par ce fédéré `{"clientId","owned","claims","given","transport","regions"}` ; vide s'il n'a plus rien |
+| `<prefix>/federations/F/ownership/<fédéré>`, `.../ownership/all` (non retained) | messages de propriété JSON (demande, annulation, cession, offre, marqueur) |
 | `.../@<instance>/update`, `.../@<instance>/delete` (non retained) | mise à jour d'attributs, suppression (binaire, `Wire.h`) |
 | `<prefix>/federations/F/interactions/<chemin de classe>/@` (non retained) | interaction (binaire) |
 | `<prefix>/federations/F/requests/<fédéré>`, `.../classrequests/<chemin>/@` (non retained) | requêtes de mise à jour d'attributs |
@@ -218,14 +222,43 @@ Seule une couverture minimale est abonnée (jamais une classe avec un de ses anc
 
 - **Découverte** par l'enregistrement retained `info` : un abonné tardif découvre aussi les objets déjà enregistrés. La classe connue est la superclasse abonnée la plus proche ; seuls les attributs abonnés pour cette classe sont reflétés.
 - **Interactions** reçues comme la classe abonnée la plus proche, avec les seuls paramètres de cette classe. Un fédéré ne reçoit pas ses propres messages.
-- **Propriété** : le fédéré qui enregistre possède les attributs publiés à l'enregistrement et HLAprivilegeToDeleteObject. Pas encore de transfert de propriété.
-- **Resign** : `DELETE_OBJECTS` et variantes suppriment les objets ; `UNCONDITIONALLY_DIVEST_ATTRIBUTES` les laisse sans propriétaire ; `NO_ACTION` lève `FederateOwnsAttributes` s'il en reste. Un fédéré disparu (Last Will) voit ses objets retirés chez les autres.
+- **Propriété** : le fédéré qui enregistre possède les attributs publiés à l'enregistrement et HLAprivilegeToDeleteObject. Tous les services du chapitre 7 sont gérés (cession inconditionnelle et négociée, acquisition avec ou sans « si disponible », refus, cession si voulue, annulations, requêtes). Voir « Propriété » ci-dessous.
+- **Resign** : `CANCEL_PENDING_OWNERSHIP_ACQUISITIONS` et `CANCEL_THEN_DELETE_THEN_DIVEST` annulent les acquisitions en cours ; `DELETE_OBJECTS` et variantes suppriment les objets dont le fédéré détient le privilège de suppression ; les variantes `DIVEST` cèdent les attributs restants (à une acquisition en attente, sinon sans propriétaire). Il reste des attributs : `FederateOwnsAttributes` ; des acquisitions non annulées : `OwnershipAcquisitionPending` (vérifié avant tout effet). Un fédéré disparu (Last Will) perd ses attributs ; les objets dont il détenait le privilège de suppression sont retirés chez les autres.
 - **Variantes horodatées** acceptées et livrées en ordre de réception avec leur temps, puisqu'aucun fédéré ne peut encore être régulateur.
 - Les mises à jour et interactions partent sans attendre l'accusé du broker (QoS 1, ou QoS 0 si tous les attributs ou l'interaction sont `HLAbestEffort`) ; Paho conserve l'ordre.
 - **Avis** : chaque fédéré publie ses abonnements (`F/decl/<fédéré>`, retained). Chacun en déduit pour lui-même `start/stopRegistrationForObjectClass` (abonnement à la classe ou à une superclasse), `turnInteractionsOn/Off`, `turnUpdatesOn/OffForObjectInstance` (attributs possédés reçus par un abonné, à la classe sous laquelle il connaît l'objet) et `attributesInScope` à la découverte. Valeurs initiales des commutateurs : `<switches>` du FOM, désactivés sinon.
-- **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un objet voyagent dans son enregistrement `info`, en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction ; il coexiste avec l'abonnement sans région (région par défaut, qui recouvre tout).
+- **DDM (régions)** : les régions sont locales au fédéré qui les crée. Handle de région = 32 bits hauts du handle de fédéré + compteur, ce qui permet de reconnaître la région d'un autre fédéré (`RegionNotCreatedByThisFederate`) sans échange. Une région neuve couvre `[0, borne)` sur chaque dimension ; `setRangeBounds` modifie les étendues en attente, `commitRegionModifications` les rend effectives. Les régions de mise à jour d'un attribut voyagent dans l'enregistrement de propriété de son propriétaire (`F/owners/...`), en étendues validées (`"regions": {"<attribut>": [{"<dimension>": [inf, sup]}, ...]}`), republié à chaque association, dissociation ou validation. Un abonnement avec régions abonne l'attribut ou l'interaction ; il coexiste avec l'abonnement sans région (région par défaut, qui recouvre tout).
 - **Filtrage DDM (côté récepteur)** : deux régions se recouvrent si leurs intervalles se chevauchent sur chaque dimension commune ; pas de région de mise à jour = région par défaut. Une valeur d'attribut est réfléchie si l'abonné est abonné sans région, ou si une de ses régions recouvre une région de mise à jour de l'attribut. Une interaction envoyée avec `sendInteractionWithRegions` porte les étendues de ses régions dans le message. `requestAttributeValueUpdateWithRegions` ne fait fournir que les attributs dont les régions de mise à jour recouvrent celles de la requête. Les abonnements avec régions seules sont publiés dans `F/decl/<fédéré>` (`"or"`) : le propriétaire en tient compte pour `turnUpdatesOn/Off`. L'abonné reçoit `attributesInScope` / `attributesOutOfScope` quand régions, abonnements ou propriété changent. La découverte n'est pas filtrée : s'abonner à la classe suffit. `conveyRegionDesignatorSets` (régions dans les informations supplémentaires) n'est pas géré.
-- **Ordre et transport choisis par l'émetteur** : `changeAttributeOrderType` / `changeInteractionOrderType` et `request*TransportationTypeChange` ne valent que pour les messages du fédéré qui les demande (confirmation par callback, immédiate). Les autres l'apprennent par les enregistrements retained : `"transport"` dans l'enregistrement `info` de l'objet, `"it"` dans `F/decl/<fédéré>` pour les interactions ; les réflexions et interactions reçues portent ce transport, et `query*TransportationType` le rapporte. `getUpdateRateValueForAttribute` rend le taux du désignateur utilisé à l'abonnement (0 sans désignateur).
+- **Ordre et transport choisis par l'émetteur** : `changeAttributeOrderType` / `changeInteractionOrderType` et `request*TransportationTypeChange` ne valent que pour les messages du fédéré qui les demande (confirmation par callback, immédiate). Les autres l'apprennent par les enregistrements retained : `"transport"` dans l'enregistrement de propriété du propriétaire de l'attribut, `"it"` dans `F/decl/<fédéré>` pour les interactions ; les réflexions et interactions reçues portent ce transport, et `query*TransportationType` le rapporte. `getUpdateRateValueForAttribute` rend le taux du désignateur utilisé à l'abonnement (0 sans désignateur).
+
+
+### Propriété
+
+Sans RTI central, chaque fédéré écrit un enregistrement retained par instance où il possède quelque chose :
+`F/owners/<instance>/<fédéré>` (attributs possédés, revendiqués, cédés en cours de transfert, transport et
+régions de mise à jour de ces attributs). Tous les fédérés joints s'y abonnent. Le propriétaire d'un attribut
+est le fédéré vivant dont l'enregistrement le liste ; aucun : l'attribut est sans propriétaire.
+
+- **Attribut possédé** : le propriétaire fait autorité. Une acquisition est une demande qui lui est envoyée
+  (`F/ownership/<propriétaire>`) et mise en file. S'il a offert l'attribut (cession négociée), il reçoit
+  `requestDivestitureConfirmation` ; sinon `requestAttributeOwnershipRelease`. Une demande « si disponible »
+  d'un attribut non offert reçoit `attributeOwnershipUnavailable`. La cession (`confirmDivestiture`, cession
+  inconditionnelle avec demande en attente, `attributeOwnershipDivestitureIfWanted`) va à la première
+  demande : le cédant inscrit l'attribut dans `given` puis envoie la cession ; le nouveau propriétaire
+  l'inscrit dans `owned` ; l'attribut n'apparaît jamais sans propriétaire pendant le transfert.
+- **Attribut sans propriétaire** : il est revendiqué. Le demandeur l'inscrit dans `claims`, puis s'envoie un
+  marqueur (aller-retour vers le broker, comme la barrière des opérations exclusives). Au retour, si aucun
+  autre enregistrement ne possède, ne cède ni ne revendique l'attribut, il le gagne. Sinon il retire sa
+  revendication : l'attribut est alors demandé à son propriétaire, ou revendiqué de nouveau par le demandeur de
+  plus petit handle pendant que les autres attendent. Deux demandeurs peuvent se retirer ensemble, jamais
+  gagner ensemble.
+- **Cession négociée** : l'offre part vers `F/ownership/all` ; les fédérés qui publient l'attribut et ne le
+  possèdent pas reçoivent `requestAttributeOwnershipAssumption`.
+- **Suppression** : le détenteur du privilège efface `info` et les enregistrements de propriété connus de
+  l'instance ; un copropriétaire non abonné à la classe apprend la suppression par l'effacement de son propre
+  enregistrement.
+- **Requêtes** : `queryAttributeOwnership` répond `informAttributeOwnership`, `attributeIsNotOwned`, ou
+  `attributeIsOwnedByRTI` pour les objets MOM. `requestAttributeValueUpdate` est envoyé à chaque propriétaire.
 
 ### Points de synchronisation
 
@@ -248,7 +281,7 @@ Le label est réservé comme un nom de fédération (réservation + barrière). 
 - **HLAmanager.HLAfederation** : construite localement par chaque fédéré à partir des enregistrements retenus (exécution, modules FOM, fédérés) ; découverte dès que la classe est souscrite, réfléchie sur requête. `HLAcurrentFDD` contient les modules fusionnés (MIM en tête).
 - **Interactions HLArequest, HLAadjust, HLAservice** : chaque fédéré reçoit ces interactions (abonnements internes) et traite celles dont `HLAfederate` est son handle ; le fédéré n'a pas à publier les rapports. Les services `HLAservice` s'exécutent sur le thread du fédéré, au prochain `evokeCallback` (ou par le dispatcher en `HLA_IMMEDIATE`) ; un échec produit `HLAreportMOMexception`. Les requêtes de niveau fédération (points de synchronisation, modules FOM, MIM) sont traitées par le fédéré vivant de plus petit handle, qui envoie aussi `HLAreportFederateLost` quand un fédéré disparaît sans resign.
 - `HLAsetSwitches` : `conveyProducingFederate` renseigne le fédéré producteur dans les informations supplémentaires de `reflectAttributeValues` et `receiveInteraction` ; `conveyRegionDesignatorSets` est seulement mémorisé. `HLAsetExceptionReporting` signale les exceptions levées par les callbacks du fédéré.
-- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré) ; `HLAmodifyAttributeState` et les services de propriété et de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
+- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré) ; `HLAmodifyAttributeState` et les services de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
 
 ## Client de test
 
@@ -267,6 +300,7 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente, `retract` (avant et après livraison, trop tard) et changement d'ordre des attributs et interactions.
 `hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région, puis le filtrage par recouvrement (déplacement des régions de mise à jour et d'abonnement), les avis de portée et de pertinence, `sendInteractionWithRegions` et `requestAttributeValueUpdateWithRegions`.
 `hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
+`hla-ownership-test` (broker requis) couvre les services de propriété entre trois fédérés : requêtes (dont `attributeIsOwnedByRTI` pour un objet MOM), exceptions, cession inconditionnelle, acquisitions simultanées d'un attribut sans propriétaire (un seul gagnant, l'autre devient une demande au gagnant), cession négociée et confirmation, acquisition « si disponible », refus et annulations, `attributeOwnershipDivestitureIfWanted`, transfert du privilège de suppression puis suppression par le nouveau détenteur, actions de resign, perte d'un propriétaire sans resign.
 `hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
@@ -310,7 +344,7 @@ ctest --preset conan-release --output-on-failure
 
 ## Suite prévue
 
-- Gestion de la propriété, sauvegarde/restauration (et leurs parties MOM).
+- Sauvegarde/restauration (et sa partie MOM), `HLAmodifyAttributeState`.
 
 ---
 Headers : *Reprinted with permission from IEEE 1516.1(TM)-2010.*
