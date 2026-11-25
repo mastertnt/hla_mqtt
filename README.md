@@ -49,6 +49,7 @@ mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmak
 tools/
   gen_rti_sources.py    régénère generated/ à partir des headers
   check_imports.py      compare les imports d'un fédéré aux exports de la DLL (Windows)
+  pe_linker_version.cpp hla-pe-linker-version : version d'éditeur de liens PE (VR-Link)
 profiles/conan1/        profils Conan 1.66 (vs2019-release, vs2019-debug)
 profiles/conan2/        profils Conan 2 (vs2019, linux-gcc)
 broker/                 configuration et scripts Mosquitto
@@ -101,11 +102,16 @@ Avec Docker : `docker compose -f broker/docker-compose.yml up`.
 | Option Conan / CMake | Défaut | Rôle |
 |---|---|---|
 | `library_name` / `HLA_MQTT_RTI_LIBRARY_NAME` | `rti1516e` | Nom du fichier DLL, à aligner sur ce qu'importe le fédéré |
+| `HLA_MQTT_FEDTIME_LIBRARY_NAME` | `fedtime1516e` | Nom du fichier DLL fedtime (`LogicalTimeFactoryFactory`) |
 | `HLA_MQTT_RTI_DEBUG_POSTFIX` | `d` | Suffixe Debug |
+| `mak_names` / `HLA_MQTT_MAK_NAMES` | `False` | Noms MÄK (`librti1516e64.dll`, `libfedtime1516e64.dll` en 64 bits, sans `64` en 32 bits) et version d'éditeur de liens PE 14.00 ; remplace les deux noms ci-dessus |
+| `pe_linker_version` / `HLA_MQTT_PE_LINKER_VERSION` | vide | Windows : version d'éditeur de liens écrite dans l'en-tête PE des DLL après l'édition de liens (`14.00` pour VR-Link) ; vide : inchangée (14.00 avec `mak_names`) |
 | `use_unique_ptr` / `HLA_MQTT_RTI_USE_UNIQUE_PTR` | `False` | `std::unique_ptr` au lieu de `std::auto_ptr` dans les signatures (ABI des headers OpenRTI en C++17 sous GCC/Clang) |
 | `with_ssl` | `False` | Paho avec TLS (`ssl://`, `mqtts://`) |
 
 Exemple (Conan 1) : `conan install . -pr:h profiles\conan1\vs2019-release -pr:b default -o library_name=rti1516e64 --build=missing`
+
+DLL sous les noms MÄK : `-DHLA_MQTT_MAK_NAMES=ON` (CMake) ou `-o mak_names=True` (Conan). La CI publie aussi l'artefact `hla-mqtt-rti-windows-x64-mak` (Release). La version PE est écrite par l'outil `hla-pe-linker-version` (`tools/pe_linker_version.cpp`, compilé avec le projet), qui vérifie aussi un fichier : `hla-pe-linker-version --check librti1516e64.dll 14.00`.
 
 ## Compatibilité binaire : règles appliquées
 
@@ -133,8 +139,8 @@ Les symboles d'**encodage** (`RTI/encoding`) et des temps standard (`RTI/time`) 
 Testé avec `f18HLA1516e_64.exe` (publie un F-18, FOM RPR) et `netdumpHLA1516e_64.exe` (affiche les entités et leurs mises à jour), sans les recompiler :
 
 - `check_imports.py` : 0 symbole manquant pour les 6 modules VR-Link qui importent le RTI (dont 126 symboles pour `vlHLA1516e.dll`).
-- Construire la DLL sous les noms attendus : `-DHLA_MQTT_RTI_LIBRARY_NAME=librti1516e64 -DHLA_MQTT_FEDTIME_LIBRARY_NAME=libfedtime1516e64`, puis mettre ce dossier dans le `PATH` des fédérés.
-- VR-Link vérifie la « version du compilateur du RTI » en lisant la version de l'éditeur de liens dans l'en-tête PE de la DLL (14.00 attendu). Avec une DLL liée par VS2019 (14.29) : f18 s'arrête (contournable par `--noRtiCompilerCheck`), netdump plante (exception non attrapée). Mettre ce champ à 14.00 suffit.
+- Construire avec `-DHLA_MQTT_MAK_NAMES=ON` (ou prendre l'artefact CI `hla-mqtt-rti-windows-x64-mak`), puis mettre le dossier des DLL dans le `PATH` des fédérés.
+- VR-Link vérifie la « version du compilateur du RTI » en lisant la version de l'éditeur de liens dans l'en-tête PE de la DLL (14.00 attendu). Avec une DLL liée par VS2019 (14.29) : f18 s'arrête (contournable par `--noRtiCompilerCheck`), netdump plante (exception non attrapée). `HLA_MQTT_MAK_NAMES` met ce champ à 14.00 après l'édition de liens (vérifié : netdump découvre le F-18 et reçoit ses 45 attributs avec la DLL du build).
 - Résultat : création de la fédération avec les modules RPR, join des deux fédérés, découverte de l'F-18 par netdump et réception de ses mises à jour (45 attributs RPR décodés).
 - VR-Link n'envoie de mises à jour qu'après `turnUpdatesOnForObjectInstance` : fonctionne depuis les callbacks d'avis (avant : il fallait `--ignoreAdvisories`).
 - Avertissements de l'essai sur les dimensions et classes MOM (`HLAfederate`, `HLAserviceGroup`, `HLAmanager.*`) absentes : le MIM standard est désormais chargé (non revérifié avec VR-Link).

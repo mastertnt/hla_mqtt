@@ -12,11 +12,15 @@ class HlaMqttRtiConan(ConanFile):
         "with_ssl": [True, False],
         "use_unique_ptr": [True, False],
         "library_name": ["ANY"],
+        "mak_names": [True, False],
+        "pe_linker_version": ["ANY"],
     }
     default_options = {
         "with_ssl": False,
         "use_unique_ptr": False,
         "library_name": "rti1516e",
+        "mak_names": False,
+        "pe_linker_version": "",
     }
     exports_sources = "CMakeLists.txt", "cmake/*", "include/*", "mim/*", "src/*", "tests/*", "tools/*"
 
@@ -41,6 +45,8 @@ class HlaMqttRtiConan(ConanFile):
         tc = CMakeToolchain(self)
         tc.cache_variables["HLA_MQTT_RTI_LIBRARY_NAME"] = str(self.options.library_name)
         tc.cache_variables["HLA_MQTT_RTI_USE_UNIQUE_PTR"] = bool(self.options.use_unique_ptr)
+        tc.cache_variables["HLA_MQTT_MAK_NAMES"] = bool(self.options.mak_names)
+        tc.cache_variables["HLA_MQTT_PE_LINKER_VERSION"] = str(self.options.pe_linker_version)
         tc.generate()
 
     def build(self):
@@ -52,4 +58,8 @@ class HlaMqttRtiConan(ConanFile):
         CMake(self).install()
 
     def package_info(self):
-        self.cpp_info.libs = [str(self.options.library_name)]
+        if self.options.mak_names:
+            bits = "64" if str(self.settings.arch) == "x86_64" else ""
+            self.cpp_info.libs = ["librti1516e" + bits, "libfedtime1516e" + bits]
+        else:
+            self.cpp_info.libs = [str(self.options.library_name)]

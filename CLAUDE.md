@@ -108,10 +108,10 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 ## Essai VR-Link 5.4 (C:\MAKrlink5.4-netUtilitiesin64)
 - f18HLA1516e_64 + netdumpHLA1516e_64 fonctionnent sur notre RTI (découverte, 45 attributs RPR reçus),
   sans `--ignoreAdvisories` depuis les avis (2026-11-24).
-- DLL sous les noms MÄK : build séparé `build-mak` avec `-DHLA_MQTT_RTI_LIBRARY_NAME=librti1516e64
-  -DHLA_MQTT_FEDTIME_LIBRARY_NAME=libfedtime1516e64`, dossier ajouté au PATH (ne rien copier dans C:\MAK).
+- DLL sous les noms MÄK : build séparé `build-mak` avec `-DHLA_MQTT_MAK_NAMES=ON` (noms + version PE 14.00,
+  issues #4 et #5), dossier ajouté au PATH (ne rien copier dans C:\MAK). Artefact CI `...-windows-x64-mak`.
 - VR-Link contrôle la version d'éditeur de liens PE de la DLL (14.00 attendu) : sinon f18 s'arrête,
-  netdump plante. Aujourd'hui corrigé à la main sur une copie ; à intégrer au build (option).
+  netdump plante. Écrite après l'édition de liens par `tools/pe_linker_version.cpp` (`hla-pe-linker-version`).
 - Les processus tués laissent des topics retained (fédération) : nettoyer le broker. Les présences offline
   sont effacées automatiquement depuis #3.
 
@@ -138,6 +138,8 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - Avertissements C4251/C4275 : inhérents à l'API standard, neutralisés par `/wd4251 /wd4275`.
 - `Octet` est un `char` signé : convertir en `unsigned char` avant de recomposer un entier (handles MOM).
 - `for (x : Json::parse(s)["k"].items())` lit un temporaire détruit : garder le `Json` dans une variable.
+- CMake : `set(X ${Y})` avec `Y` vide désaffecte `X` ; un `if(X STREQUAL "")` compare alors le nom littéral.
+  Toujours `set(X "${Y}")` et `if("${X}" ...)`.
 - Paho C : une connexion qui suit de près une déconnexion (même avec un autre handle) attend ~1 s. D'où la
   session propre plutôt qu'une session persistante purgée par une connexion supplémentaire.
 
@@ -145,5 +147,4 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 1. `check_imports.py` sur un vrai fédéré (selftest Windows validé).
 2. Compiler et tester l'encodage sous Linux/GCC.
 3. Tester la substitution de DLL sur un vrai fédéré dès qu'un exécutable est disponible.
-4. Option de build « version d'éditeur de liens PE » (compatibilité VR-Link).
-5. Propriété, sauvegarde/restauration.
+4. Propriété, sauvegarde/restauration.

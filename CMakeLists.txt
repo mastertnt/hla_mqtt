@@ -12,6 +12,28 @@ option(HLA_MQTT_RTI_USE_UNIQUE_PTR
     "Map RTI_UNIQUE_PTR to std::unique_ptr (ABI of OpenRTI headers built in C++17 with GCC/Clang). OFF = std::auto_ptr, IEEE ABI."
     OFF)
 option(HLA_MQTT_RTI_BUILD_TESTS "Build the test federate" ON)
+option(HLA_MQTT_MAK_NAMES
+    "MAK RTI file names (librti1516e64 / libfedtime1516e64 in 64 bits, without 64 in 32 bits) and PE linker version 14.00 (VR-Link). Overrides the two library names."
+    OFF)
+set(HLA_MQTT_PE_LINKER_VERSION "" CACHE STRING
+    "Windows: linker version written into the PE header of the DLLs after the link (<major>.<minor>, e.g. 14.00, expected by VR-Link). Empty: unchanged. 14.00 by default with HLA_MQTT_MAK_NAMES.")
+
+set(HLA_MQTT_RTI_OUTPUT_NAME ${HLA_MQTT_RTI_LIBRARY_NAME})
+set(HLA_MQTT_FEDTIME_OUTPUT_NAME ${HLA_MQTT_FEDTIME_LIBRARY_NAME})
+set(HLA_MQTT_PE_VERSION "${HLA_MQTT_PE_LINKER_VERSION}")
+if(HLA_MQTT_MAK_NAMES)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_mak_bits 64)
+  else()
+    set(_mak_bits "")
+  endif()
+  set(HLA_MQTT_RTI_OUTPUT_NAME librti1516e${_mak_bits})
+  set(HLA_MQTT_FEDTIME_OUTPUT_NAME libfedtime1516e${_mak_bits})
+  if("${HLA_MQTT_PE_VERSION}" STREQUAL "")
+    set(HLA_MQTT_PE_VERSION "14.00")
+  endif()
+endif()
+message(STATUS "RTI libraries: ${HLA_MQTT_RTI_OUTPUT_NAME}, ${HLA_MQTT_FEDTIME_OUTPUT_NAME}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -88,7 +110,7 @@ if(HLA_MQTT_RTI_USE_UNIQUE_PTR)
 endif()
 target_link_libraries(rti1516e PRIVATE ${PAHO_TARGET})
 set_target_properties(rti1516e PROPERTIES
-  OUTPUT_NAME  ${HLA_MQTT_RTI_LIBRARY_NAME}
+  OUTPUT_NAME  ${HLA_MQTT_RTI_OUTPUT_NAME}
   DEBUG_POSTFIX "${HLA_MQTT_RTI_DEBUG_POSTFIX}"
   VERSION ${PROJECT_VERSION}
   SOVERSION 1)
@@ -113,13 +135,34 @@ add_library(fedtime1516e SHARED src/fedtime1516e/LogicalTimeFactoryFactory.cpp)
 target_compile_definitions(fedtime1516e PRIVATE BUILDING_FEDTIME RTI_DISABLE_WARNINGS)
 target_link_libraries(fedtime1516e PUBLIC rti1516e)
 set_target_properties(fedtime1516e PROPERTIES
-  OUTPUT_NAME  ${HLA_MQTT_FEDTIME_LIBRARY_NAME}
+  OUTPUT_NAME  ${HLA_MQTT_FEDTIME_OUTPUT_NAME}
   DEBUG_POSTFIX "${HLA_MQTT_RTI_DEBUG_POSTFIX}"
   VERSION ${PROJECT_VERSION}
   SOVERSION 1)
 if(MSVC)
   target_compile_options(fedtime1516e PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
   set_property(TARGET fedtime1516e PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
+# ---------------------------------------------------------------- PE linker version
+# VR-Link reads the linker version of the PE header as the "compiler version"
+# of the RTI: written after the link by a small host tool.
+if(WIN32 AND NOT "${HLA_MQTT_PE_VERSION}" STREQUAL "")
+  if(NOT "${HLA_MQTT_PE_VERSION}" MATCHES "^[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "HLA_MQTT_PE_LINKER_VERSION: <major>.<minor> expected, got '${HLA_MQTT_PE_VERSION}'")
+  endif()
+  add_executable(hla-pe-linker-version tools/pe_linker_version.cpp)
+  if(MSVC)
+    target_compile_options(hla-pe-linker-version PRIVATE /W3)
+  endif()
+  foreach(lib rti1516e fedtime1516e)
+    add_dependencies(${lib} hla-pe-linker-version)
+    add_custom_command(TARGET ${lib} POST_BUILD
+      COMMAND $<TARGET_FILE:hla-pe-linker-version> $<TARGET_FILE:${lib}> ${HLA_MQTT_PE_VERSION}
+      COMMENT "PE linker version ${HLA_MQTT_PE_VERSION}: $<TARGET_FILE_NAME:${lib}>"
+      VERBATIM)
+  endforeach()
+  message(STATUS "PE linker version of the DLLs: ${HLA_MQTT_PE_VERSION}")
 endif()
 
 # ---------------------------------------------------------------- test federate
@@ -213,6 +256,12 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
     set_property(TARGET hla-robustness-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
   endif()
   add_test(NAME robustness COMMAND hla-robustness-test)
+
+  if(TARGET hla-pe-linker-version)
+    add_test(NAME pe-linker-version COMMAND hla-pe-linker-version --check $<TARGET_FILE:rti1516e> ${HLA_MQTT_PE_VERSION})
+    add_test(NAME pe-linker-version-fedtime
+             COMMAND hla-pe-linker-version --check $<TARGET_FILE:fedtime1516e> ${HLA_MQTT_PE_VERSION})
+  endif()
 endif()
 
 # ---------------------------------------------------------------- install
