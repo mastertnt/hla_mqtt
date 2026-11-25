@@ -46,6 +46,7 @@ tests/time/             hla-time-test : points de synchronisation, gestion du te
 tests/ddm/              hla-ddm-test : régions, associations, abonnements avec régions
 tests/mom/              hla-mom-test : MOM (objets HLAmanager, requêtes, rapports, services)
 tests/ownership/        hla-ownership-test : propriété (cessions, acquisitions concurrentes, resign)
+tests/saverestore/      hla-saverestore-test : sauvegarde et restauration de la fédération
 tests/robustness/       hla-robustness-test : reconnexion, présences périmées
 mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
@@ -197,6 +198,9 @@ Tous les topics sont retained, sauf `sync`. `F` est le nom de la fédération, e
 | `<prefix>/federations/F/objects/<chemin de classe>/@<instance>/info` | enregistrement immuable de l'instance `{"instance","class","name","registrant","clientId"}` |
 | `<prefix>/federations/F/owners/<instance>/<fédéré>` | propriété : attributs possédés par ce fédéré `{"clientId","owned","claims","given","transport","regions"}` ; vide s'il n'a plus rien |
 | `<prefix>/federations/F/ownership/<fédéré>`, `.../ownership/all` (non retained) | messages de propriété JSON (demande, annulation, cession, offre, marqueur) |
+| `<prefix>/federations/F/save/state`, `.../save/status/<fédéré>` | sauvegarde en cours `{"id","label","time"?,"requester","members","aborted"?}` ; statut d'un membre `{"id","status":"begun"/"complete"/"notcomplete"}` |
+| `<prefix>/federations/F/saves/<label>/<id>/<fédéré>`, `.../saves/<label>/info` | état RTI sauvegardé d'un fédéré `{"name","type","handle","state"}` ; dernière sauvegarde réussie du label `{"id","federates"}` |
+| `<prefix>/federations/F/restore/state`, `.../restore/status/<fédéré>` | restauration en cours `{"id","label","save","requester","members":[{"h","c","s","n"}],"aborted"?}` ; statut `cleared`/`complete`/`notcomplete`/`failed`/`resigned` (handle d'avant la restauration) |
 | `.../@<instance>/update`, `.../@<instance>/delete` (non retained) | mise à jour d'attributs, suppression (binaire, `Wire.h`) |
 | `<prefix>/federations/F/interactions/<chemin de classe>/@` (non retained) | interaction (binaire) |
 | `<prefix>/federations/F/requests/<fédéré>`, `.../classrequests/<chemin>/@` (non retained) | requêtes de mise à jour d'attributs |
@@ -264,6 +268,14 @@ est le fédéré vivant dont l'enregistrement le liste ; aucun : l'attribut est 
   (sans propriétaire). Objet inconnu, attribut non publié à la classe connue ou attribut MOM :
   `HLAreportMOMexception`, sans effet.
 
+### Sauvegarde et restauration
+
+- **Sauvegarde** : le demandeur réserve `F/save/state` (revendication + barrière, comme un label de synchronisation) ; les membres sont les fédérés joints à la demande. Chacun reçoit `initiateFederateSave` aussitôt, ou, s'il est contraint, une fois accordé au temps de sauvegarde (sans avance en cours). `federateSaveComplete` publie l'état RTI du fédéré puis son statut. Chaque membre décide seul du résultat : tous `complete` → `federationSaved` ; un `notcomplete`, un abandon, un membre qui a quitté (`FEDERATE_RESIGNED_DURING_SAVE`) ou disparu (`RTI_DETECTED_FAILURE_DURING_SAVE`) → `federationNotSaved`. Le demandeur (ou le plus petit membre vivant) publie alors `saves/<label>/info` et efface les états de l'ancienne sauvegarde du label (ou ceux de la sauvegarde ratée).
+- **Restauration** : le demandeur vérifie que les fédérés joints ont les types des fédérés sauvegardés ; un fédéré sauvegardé reprend sa propre identité, les autres prennent les identités restantes de leur type. Puis `requestFederationRestoreSucceeded` (ou `Failed`) et publication de la correspondance. Chaque membre reçoit `federationRestoreBegun`, efface les enregistrements retained qu'il a écrits (propriété, `info`, déclarations, temps, noms réservés, enregistrement de fédéré si son handle change) et publie `cleared`. Quand tous ont effacé, chacun charge son état, prend son handle et son nom sauvegardés, republie ses enregistrements et reçoit `initiateFederateRestore` ; `federationRestored` quand tous ont terminé. Abandon avant le chargement : l'état courant est republié.
+- **État sauvegardé** : publications, abonnements (avec régions et taux), ordre et transport changés, régions, instances connues ou enregistrées (classe, nom, attributs possédés, régions de mise à jour, ordre, transport, avis notifiés), noms réservés, commutateurs d'avis, temps (temps logique, lookahead, régulation, contrainte, livraison asynchrone).
+- Pendant la sauvegarde (resp. la restauration), les services concernés lèvent `SaveInProgress` (resp. `RestoreInProgress`). Pendant la restauration, les messages d'objets et de propriété, l'avance du temps et les avis sont suspendus.
+- Limites : opérations de propriété en cours, files de messages et points de synchronisation non sauvegardés ; l'objet MOM `HLAfederate` garde son nom ; un fédéré contraint en avance au-delà du temps de sauvegarde n'est instruit qu'à la fin de son avance ; partie MOM (`HLArequestFederationSave`, etc.) non implémentée.
+
 ### Points de synchronisation
 
 Le label est réservé comme un nom de fédération (réservation + barrière). Chaque membre décide seul que le point est synchronisé : tous les membres l'ont atteint ou ont quitté la fédération. Le déclarant efface ensuite les enregistrements, ce qui libère le label. L'ensemble est figé à la déclaration (fédérés joints, ou l'ensemble donné) : un fédéré qui joint après n'en fait pas partie.
@@ -285,7 +297,7 @@ Le label est réservé comme un nom de fédération (réservation + barrière). 
 - **HLAmanager.HLAfederation** : construite localement par chaque fédéré à partir des enregistrements retenus (exécution, modules FOM, fédérés) ; découverte dès que la classe est souscrite, réfléchie sur requête. `HLAcurrentFDD` contient les modules fusionnés (MIM en tête).
 - **Interactions HLArequest, HLAadjust, HLAservice** : chaque fédéré reçoit ces interactions (abonnements internes) et traite celles dont `HLAfederate` est son handle ; le fédéré n'a pas à publier les rapports. Les services `HLAservice` s'exécutent sur le thread du fédéré, au prochain `evokeCallback` (ou par le dispatcher en `HLA_IMMEDIATE`) ; un échec produit `HLAreportMOMexception`. Les requêtes de niveau fédération (points de synchronisation, modules FOM, MIM) sont traitées par le fédéré vivant de plus petit handle, qui envoie aussi `HLAreportFederateLost` quand un fédéré disparaît sans resign.
 - `HLAsetSwitches` : `conveyProducingFederate` renseigne le fédéré producteur dans les informations supplémentaires de `reflectAttributeValues` et `receiveInteraction` ; `conveyRegionDesignatorSets` est seulement mémorisé. `HLAsetExceptionReporting` signale les exceptions levées par les callbacks du fédéré.
-- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré)  ; les services de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
+- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré)  ; les services MOM de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
 
 ## Client de test
 
@@ -305,6 +317,7 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région, puis le filtrage par recouvrement (déplacement des régions de mise à jour et d'abonnement), les avis de portée et de pertinence, `sendInteractionWithRegions` et `requestAttributeValueUpdateWithRegions`.
 `hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
 `hla-ownership-test` (broker requis) couvre les services de propriété entre trois fédérés : requêtes (dont `attributeIsOwnedByRTI` pour un objet MOM), exceptions, cession inconditionnelle, acquisitions simultanées d'un attribut sans propriétaire (un seul gagnant, l'autre devient une demande au gagnant), cession négociée et confirmation, acquisition « si disponible », refus et annulations, `attributeOwnershipDivestitureIfWanted`, transfert du privilège de suppression puis suppression par le nouveau détenteur, actions de resign, perte d'un propriétaire sans resign, `HLAmodifyAttributeState` (prise, abandon, erreur).
+`hla-saverestore-test` (broker requis) couvre sauvegarde et restauration : callbacks et leur ordre, requêtes de statut, exceptions (services refusés pendant la sauvegarde ou la restauration), état restauré (propriété, objet enregistré après la sauvegarde oublié, déclarations, temps logique et contrainte), sauvegarde horodatée avec un fédéré contraint, `federateSaveNotComplete` et `federateRestoreNotComplete`, abandons, membre qui quitte ou disparaît pendant une sauvegarde, restauration refusée (label inconnu, autre ensemble de fédérés) et restauration dans un nouveau fédéré qui reprend le nom et le handle sauvegardés.
 `hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
@@ -348,7 +361,7 @@ ctest --preset conan-release --output-on-failure
 
 ## Suite prévue
 
-- Sauvegarde/restauration (et sa partie MOM).
+- Partie MOM de la sauvegarde/restauration.
 
 ---
 Headers : *Reprinted with permission from IEEE 1516.1(TM)-2010.*

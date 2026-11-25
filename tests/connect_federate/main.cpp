@@ -125,8 +125,8 @@ int selfTest(std::wstring const& settings)
    // Federation management (jalon 2): a missing FOM file is reported as such.
    expectThrow<CouldNotOpenFDD>(L"createFederationExecution with a missing FOM",
       [&] { rti->createFederationExecution(L"TestFederation", L"no-such-fom.xml"); });
-   // Services of later milestones -> RTIinternalError.
-   expectThrow<RTIinternalError>(L"requestFederationSave (not implemented yet)",
+   // Federation services outside a federation execution.
+   expectThrow<FederateNotExecutionMember>(L"requestFederationSave while not joined",
       [&] { rti->requestFederationSave(L"save"); });
 
    expectOk(L"disconnect", [&] { rti->disconnect(); });

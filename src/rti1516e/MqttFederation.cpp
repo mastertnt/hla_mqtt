@@ -192,12 +192,18 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
       std::string const rest = topic.substr(_fedTopic.size() + 1);
       if (startsWith(rest, "sync/"))
          handleSyncTraffic(rest, payload);
+      else if (startsWith(rest, "save/"))
+         handleSaveTraffic(rest, payload);
+      else if (startsWith(rest, "restore/"))
+         handleRestoreTraffic(rest, payload);
       else if (startsWith(rest, "federates/"))
       {
-         // A federate joined or left: synchronization sets, GALT.
+         // A federate joined or left: synchronization sets, GALT, save and restore members.
          evaluateAllSync();
          evaluateTime();
          evaluateAdvisories();
+         evaluateSave();
+         evaluateRestore();
       }
    }
    if (_fdd && _transport && startsWith(topic, _transport->settings().topicPrefix + "/clients/"))
@@ -205,6 +211,8 @@ void MqttRTIambassador::onMessage(std::string const& topic, std::string const& p
       evaluateAllSync();
       evaluateTime();
       evaluateAdvisories();
+      evaluateSave();
+      evaluateRestore();
    }
 
    // Module added by another federate of our federation: the FDD only grows.
@@ -869,6 +877,31 @@ void MqttRTIambassador::resignFederationExecution(ResignAction resignAction)
    if (resignAction < UNCONDITIONALLY_DIVEST_ATTRIBUTES || resignAction > NO_ACTION)
       throw InvalidResignAction(L"unknown resign action");
    std::string const ft = _fedTopic;
+   {
+      // Resigned during a restore: the other members end it (federationNotRestored).
+      std::lock_guard<std::mutex> v(_viewMutex);
+      if (_restore.active && !_restore.done && _restore.member)
+      {
+         std::uint64_t pre = _federateHandle;
+         if (_restore.loaded)
+            for (RestoreMember const& m : _restore.members)
+               if (m.saved == _federateHandle)
+                  pre = m.handle;
+         Json st = Json::object();
+         st.set("id", _restore.id);
+         st.set("status", "resigned");
+         try
+         {
+            _transport->publishAsync(ft + "/restore/status/" + hex64(pre), st.dump(), 1, true);
+         }
+         catch (std::runtime_error const&)
+         {
+         }
+      }
+      _restoring = false;
+      _saveBusy = false;
+      _restoreBusy = false;
+   }
    try
    {
       resignObjects(resignAction); // FederateOwnsAttributes before any change

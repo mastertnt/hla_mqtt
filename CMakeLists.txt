@@ -81,6 +81,7 @@ add_library(rti1516e SHARED
   src/rti1516e/MqttRegions.cpp
   src/rti1516e/MqttObjectOptions.cpp
   src/rti1516e/MqttOwnership.cpp
+  src/rti1516e/MqttSaveRestore.cpp
   src/rti1516e/MqttMom.cpp
   src/rti1516e/Trace.cpp
   src/rti1516e/Fdd.cpp
@@ -257,6 +258,17 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
   endif()
   add_test(NAME ownership COMMAND hla-ownership-test)
 
+  # Federation save and restore (4.16 to 4.32): needs a broker.
+  add_executable(hla-saverestore-test tests/saverestore/main.cpp)
+  target_link_libraries(hla-saverestore-test PRIVATE rti1516e)
+  target_compile_definitions(hla-saverestore-test PRIVATE
+    HLA_TEST_FOM_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/federation/foms")
+  if(MSVC)
+    target_compile_options(hla-saverestore-test PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-saverestore-test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_test(NAME saverestore COMMAND hla-saverestore-test)
+
   # Reconnection and stale presences: needs a broker; a raw MQTT client cuts
   # the connections.
   add_executable(hla-robustness-test tests/robustness/main.cpp)
@@ -284,5 +296,5 @@ install(TARGETS rti1516e fedtime1516e
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/RTI DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(HLA_MQTT_RTI_BUILD_TESTS)
-  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test hla-ownership-test hla-robustness-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(TARGETS hla-test-federate hla-encoding-test hla-federation-test hla-objects-test hla-time-test hla-ddm-test hla-mom-test hla-ownership-test hla-saverestore-test hla-robustness-test RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

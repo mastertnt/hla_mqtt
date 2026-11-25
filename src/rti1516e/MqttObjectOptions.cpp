@@ -135,6 +135,7 @@ void MqttRTIambassador::requestAttributeTransportationTypeChange(ObjectInstanceH
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::string topic, payload;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
@@ -171,6 +172,7 @@ void MqttRTIambassador::queryAttributeTransportationType(ObjectInstanceHandle th
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t cls = 0;
    ObjectInstance const* o = knownObject(_objects, theObject, _federateHandle, cls);
@@ -188,6 +190,7 @@ void MqttRTIambassador::requestInteractionTransportationTypeChange(InteractionCl
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
@@ -207,6 +210,7 @@ void MqttRTIambassador::queryInteractionTransportationType(FederateHandle theFed
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t const c = InteractionClassHandleFriend::value(theInteraction);
    if (!_fdd->interactionClass(c))
@@ -223,6 +227,7 @@ void MqttRTIambassador::changeAttributeOrderType(ObjectInstanceHandle theObject,
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t cls = 0;
    ObjectInstance* o = knownObject(_objects, theObject, _federateHandle, cls);
@@ -242,6 +247,7 @@ void MqttRTIambassador::changeInteractionOrderType(InteractionClassHandle theCla
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
    if (!_fdd->interactionClass(c))

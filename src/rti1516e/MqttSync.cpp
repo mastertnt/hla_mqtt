@@ -77,6 +77,7 @@ void MqttRTIambassador::registerFederationSynchronizationPoint(std::wstring cons
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
 
    std::set<std::uint64_t> members;
    {
@@ -174,6 +175,7 @@ void MqttRTIambassador::synchronizationPointAchieved(std::wstring const& label, 
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::string const key = encodeTopicLevel(toUtf8(label));
    {
       std::lock_guard<std::mutex> v(_viewMutex);

@@ -141,6 +141,11 @@ void MqttRTIambassador::subscribeJoinedTopics()
       std::lock_guard<std::mutex> v(_viewMutex);
       _syncPoints.clear();
       resetTime();
+      _save = FederationSave();
+      _restore = FederationRestore();
+      _restoring = false;
+      _saveBusy = false;
+      _restoreBusy = false;
    }
    {
       // Advisory switches: FOM <switches>, disabled when absent.
@@ -161,13 +166,16 @@ void MqttRTIambassador::subscribeJoinedTopics()
    _transport->subscribe(ft + "/owners/#");
    _transport->subscribe(ft + "/ownership/" + hex64(_federateHandle));
    _transport->subscribe(ft + "/ownership/all");
+   _transport->subscribe(ft + "/saves/#");
+   _transport->subscribe(ft + "/save/#");
+   _transport->subscribe(ft + "/restore/#");
 }
 
 void MqttRTIambassador::unsubscribeJoinedTopics() noexcept
 {
    std::string const ft = _fedTopic;
    for (char const* t : {"/execution", "/fom/+", "/federates/+", "/classrequests/#", "/sync/#", "/time/+", "/decl/+",
-                         "/owners/#", "/ownership/all"})
+                         "/owners/#", "/ownership/all", "/saves/#", "/save/#", "/restore/#"})
       _transport->unsubscribe(ft + t);
    _transport->unsubscribe(ft + "/requests/" + hex64(_federateHandle));
    _transport->unsubscribe(ft + "/ownership/" + hex64(_federateHandle));
@@ -256,7 +264,7 @@ void MqttRTIambassador::updateBrokerSubscriptions()
 // ============================================================ incoming traffic
 void MqttRTIambassador::tryDiscover(ObjectInstance& o)
 {
-   if (o.knownClass != 0 || staleObject(o.handle))
+   if (o.knownClass != 0 || _restoring || staleObject(o.handle))
       return;
    std::uint64_t const k = knownObjectClass(o.objectClass);
    if (k == 0)
@@ -309,6 +317,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          std::uint64_t const instance = at == std::string::npos ? 0 : parseHex(rest.substr(at + 2));
          if (payload.empty()) // info cleared: deleted (normally after a delete message)
          {
+            if (_restoring)
+               return; // cleared by its holder for the restore (see MqttSaveRestore.cpp)
             auto it = _objects.find(instance);
             if (it != _objects.end() && !it->second.mom && !it->second.owned.count(privilegeAttribute()))
             {
@@ -347,6 +357,8 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          return;
       }
 
+      if (_restoring)
+         return; // updates, interactions, requests and deletions of the restoring federation
       WireReader r(payload);
       std::uint64_t const sender = r.u64();
       std::uint64_t const seq = r.u64();
@@ -589,6 +601,7 @@ void MqttRTIambassador::publishObjectClassAttributes(ObjectClassHandle theClass,
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
    HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, attributeList)
@@ -602,6 +615,7 @@ void MqttRTIambassador::unpublishObjectClass(ObjectClassHandle theClass)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
    _publishedAttributes.erase(theClassValue);
@@ -613,6 +627,7 @@ void MqttRTIambassador::unpublishObjectClassAttributes(ObjectClassHandle theClas
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
    HLA_MQTT_CHECK_ATTRIBUTES(theClassValue, attributeList)
@@ -630,6 +645,7 @@ void MqttRTIambassador::publishInteractionClass(InteractionClassHandle theIntera
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t const c = InteractionClassHandleFriend::value(theInteraction);
    if (!_fdd->interactionClass(c))
@@ -643,6 +659,7 @@ void MqttRTIambassador::unpublishInteractionClass(InteractionClassHandle theInte
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t const c = InteractionClassHandleFriend::value(theInteraction);
    if (!_fdd->interactionClass(c))
@@ -658,6 +675,7 @@ void MqttRTIambassador::subscribeObjectClassAttributes(ObjectClassHandle theClas
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
@@ -679,6 +697,7 @@ void MqttRTIambassador::unsubscribeObjectClass(ObjectClassHandle theClass)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
@@ -693,6 +712,7 @@ void MqttRTIambassador::unsubscribeObjectClassAttributes(ObjectClassHandle theCl
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       HLA_MQTT_CHECK_OBJECT_CLASS(theClass)
@@ -714,6 +734,7 @@ void MqttRTIambassador::subscribeInteractionClass(InteractionClassHandle theClas
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
@@ -730,6 +751,7 @@ void MqttRTIambassador::unsubscribeInteractionClass(InteractionClassHandle theCl
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const c = InteractionClassHandleFriend::value(theClass);
@@ -849,6 +871,7 @@ void MqttRTIambassador::reserveObjectInstanceName(std::wstring const& theObjectI
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    reserveNames(std::set<std::wstring>{theObjectInstanceName}, false);
 }
 
@@ -856,6 +879,7 @@ void MqttRTIambassador::reserveMultipleObjectInstanceName(std::set<std::wstring>
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    if (theObjectInstanceNames.empty())
       throw IllegalName(L"empty set of names");
    reserveNames(theObjectInstanceNames, true);
@@ -870,6 +894,7 @@ void MqttRTIambassador::releaseMultipleObjectInstanceName(std::set<std::wstring>
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       for (std::wstring const& n : theObjectInstanceNames)
@@ -895,6 +920,7 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstance(ObjectClassHandle
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    return registerObject(theClass, theObjectInstanceName, nullptr);
 }
 
@@ -993,6 +1019,7 @@ void MqttRTIambassador::updateAttributeValues(ObjectInstanceHandle theObject,
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::string topic;
    int qos = 0;
    WireWriter w(WireKind::Update);
@@ -1030,6 +1057,7 @@ MessageRetractionHandle MqttRTIambassador::updateAttributeValues(ObjectInstanceH
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::string const time = encodeTime(theTime);
    std::uint64_t const retraction = newUniqueValue("R");
    // Attributes with the TimeStamp order go TSO (if regulating), the others RO
@@ -1092,6 +1120,7 @@ void MqttRTIambassador::sendInteraction(InteractionClassHandle theInteraction,
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, nullptr, nullptr);
 }
 
@@ -1102,6 +1131,7 @@ MessageRetractionHandle MqttRTIambassador::sendInteraction(InteractionClassHandl
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    return sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, &theTime, nullptr);
 }
 
@@ -1186,6 +1216,7 @@ void MqttRTIambassador::deleteObjectInstance(ObjectInstanceHandle theObject, Var
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    ObjectInstance o;
    std::vector<std::string> records;
    {
@@ -1217,6 +1248,7 @@ MessageRetractionHandle MqttRTIambassador::deleteObjectInstance(ObjectInstanceHa
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::string const time = encodeTime(theTime);
    ObjectInstance o;
    std::vector<std::string> records;
@@ -1252,6 +1284,7 @@ void MqttRTIambassador::localDeleteObjectInstance(ObjectInstanceHandle theObject
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _objects.find(ObjectInstanceHandleFriend::value(theObject));
    if (it == _objects.end() || it->second.knownClass == 0)
@@ -1270,6 +1303,7 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectInstanceHandle theObje
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::map<std::uint64_t, std::vector<std::uint64_t>> byOwner; // the owners other than us
    std::uint64_t cls = 0;
    {
@@ -1310,6 +1344,7 @@ void MqttRTIambassador::requestAttributeValueUpdate(ObjectClassHandle theClass, 
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    requestClassUpdate(theClass, theAttributes, nullptr, theUserSuppliedTag);
 }
 
@@ -1468,7 +1503,7 @@ std::wstring MqttRTIambassador::getObjectInstanceName(ObjectInstanceHandle theHa
 
 // 5.10 to 5.17 advisory switches: stored, with the standard IsOn/IsOff
 // checks; no advisory callback is generated yet.
-#define HLA_MQTT_SWITCH(Name, index, value, AlreadyExc)    void MqttRTIambassador::Name()    {       checkJoined();       if (_advisorySwitches[index] == value)          throw AlreadyExc(L"" #Name);       setAdvisorySwitch(index, value);    }
+#define HLA_MQTT_SWITCH(Name, index, value, AlreadyExc)    void MqttRTIambassador::Name()    {       checkJoined();       checkNotSavingOrRestoring();       if (_advisorySwitches[index] == value)          throw AlreadyExc(L"" #Name);       setAdvisorySwitch(index, value);    }
 
 HLA_MQTT_SWITCH(enableObjectClassRelevanceAdvisorySwitch, 0, true, ObjectClassRelevanceAdvisorySwitchIsOn)
 HLA_MQTT_SWITCH(disableObjectClassRelevanceAdvisorySwitch, 0, false, ObjectClassRelevanceAdvisorySwitchIsOff)

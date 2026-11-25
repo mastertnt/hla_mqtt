@@ -288,7 +288,7 @@ void MqttRTIambassador::handleOwnershipTraffic(std::string const& rest, std::str
             return;
          handleOwnerRecord(parseHex(tail.substr(0, slash)), parseHex(tail.substr(slash + 1)), payload);
       }
-      else if (startsWith(rest, "ownership/") && !payload.empty())
+      else if (startsWith(rest, "ownership/") && !payload.empty() && !_restoring)
       {
          std::string const to = rest.substr(10);
          handleOwnershipMessage(to == "all" ? 0 : parseHex(to), payload);
@@ -305,7 +305,7 @@ void MqttRTIambassador::handleOwnerRecord(std::uint64_t instance, std::uint64_t 
    auto it = _objects.find(instance);
    if (federate == _federateHandle)
    {
-      if (it == _objects.end())
+      if (it == _objects.end() || _restoring)
          return;
       ObjectInstance& o = it->second;
       if (o.recordsInFlight > 0)
@@ -356,8 +356,8 @@ void MqttRTIambassador::handleOwnerRecord(std::uint64_t instance, std::uint64_t 
             r.regions[parseHex(kv.first)].push_back(extentsFromJson(e));
       _ownerRecords[instance][federate] = r;
    }
-   if (it == _objects.end())
-      return;
+   if (it == _objects.end() || _restoring)
+      return; // restoring: the table only, the objects are reloaded
    if (!it->second.mom && staleObject(instance)) // retained record of a vanished privilege holder
    {
       bool const known = it->second.knownClass != 0;
@@ -949,6 +949,7 @@ void MqttRTIambassador::unconditionalAttributeOwnershipDivestiture(ObjectInstanc
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, theAttributes, attrs);
@@ -963,6 +964,7 @@ void MqttRTIambassador::negotiatedAttributeOwnershipDivestiture(ObjectInstanceHa
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, theAttributes, attrs);
@@ -991,6 +993,7 @@ void MqttRTIambassador::confirmDivestiture(ObjectInstanceHandle theObject, Attri
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, confirmedAttributes, attrs);
@@ -1009,6 +1012,7 @@ void MqttRTIambassador::attributeOwnershipAcquisition(ObjectInstanceHandle theOb
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, desiredAttributes, attrs);
@@ -1039,6 +1043,7 @@ void MqttRTIambassador::attributeOwnershipAcquisitionIfAvailable(ObjectInstanceH
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, desiredAttributes, attrs);
@@ -1063,6 +1068,7 @@ void MqttRTIambassador::attributeOwnershipReleaseDenied(ObjectInstanceHandle the
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, theAttributes, attrs);
@@ -1078,6 +1084,7 @@ void MqttRTIambassador::attributeOwnershipDivestitureIfWanted(ObjectInstanceHand
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, theAttributes, attrs);
@@ -1130,6 +1137,7 @@ void MqttRTIambassador::cancelAttributeOwnershipAcquisition(ObjectInstanceHandle
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::set<std::uint64_t> attrs;
    ObjectInstance& o = ownershipObject(theObject, theAttributes, attrs);
@@ -1150,6 +1158,7 @@ void MqttRTIambassador::queryAttributeOwnership(ObjectInstanceHandle theObject, 
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    AttributeHandleSet one;
    one.insert(theAttribute);
@@ -1177,6 +1186,7 @@ bool MqttRTIambassador::isAttributeOwnedByFederate(ObjectInstanceHandle theObjec
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    AttributeHandleSet one;
    one.insert(theAttribute);

@@ -264,7 +264,7 @@ Bound MqttRTIambassador::sendBound() const
 
 void MqttRTIambassador::evaluateTime()
 {
-   if (!_fdd || !_joined)
+   if (!_fdd || !_joined || _restoring)
       return;
    for (int round = 0; round < 8; ++round)
    {
@@ -353,6 +353,7 @@ void MqttRTIambassador::evaluateTime()
       if (!changed)
          break;
    }
+   evaluateSave(); // timed save: instructed once granted at the save time
 }
 
 void MqttRTIambassador::publishTimeState(bool /*meaningful*/)
@@ -503,6 +504,7 @@ void MqttRTIambassador::retract(MessageRetractionHandle theHandle)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.regulating)
       throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");
@@ -534,6 +536,7 @@ void MqttRTIambassador::enableTimeRegulation(LogicalTimeInterval const& theLooka
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::unique_lock<std::mutex> v(_viewMutex);
    if (_time.regulating)
       throw TimeRegulationAlreadyEnabled(L"time regulation already enabled");
@@ -566,6 +569,7 @@ void MqttRTIambassador::disableTimeRegulation()
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.regulating && !_time.regPending)
       throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");
@@ -580,6 +584,7 @@ void MqttRTIambassador::enableTimeConstrained()
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::unique_lock<std::mutex> v(_viewMutex);
    if (_time.constrained)
       throw TimeConstrainedAlreadyEnabled(L"time constrained already enabled");
@@ -608,6 +613,7 @@ void MqttRTIambassador::disableTimeConstrained()
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.constrained && !_time.conPending)
       throw TimeConstrainedIsNotEnabled(L"time constrained is not enabled");
@@ -631,6 +637,7 @@ void MqttRTIambassador::startAdvance(Advance kind, LogicalTime const& theTime)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (_time.advance != Advance::None)
       throw InTimeAdvancingState(L"already in time advancing state");
@@ -680,6 +687,7 @@ void MqttRTIambassador::enableAsynchronousDelivery()
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (_time.asyncDelivery)
       throw AsynchronousDeliveryAlreadyEnabled(L"asynchronous delivery already enabled");
@@ -693,6 +701,7 @@ void MqttRTIambassador::disableAsynchronousDelivery()
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.asyncDelivery)
       throw AsynchronousDeliveryAlreadyDisabled(L"asynchronous delivery already disabled");
@@ -702,6 +711,7 @@ void MqttRTIambassador::disableAsynchronousDelivery()
 bool MqttRTIambassador::queryGALT(LogicalTime& theTime)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    Bound g;
    if (!galt(g))
@@ -713,6 +723,7 @@ bool MqttRTIambassador::queryGALT(LogicalTime& theTime)
 void MqttRTIambassador::queryLogicalTime(LogicalTime& theTime)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    _time.time.assignTo(theTime);
 }
@@ -720,6 +731,7 @@ void MqttRTIambassador::queryLogicalTime(LogicalTime& theTime)
 bool MqttRTIambassador::queryLITS(LogicalTime& theTime)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    Bound g;
    bool const hasG = galt(g);
@@ -736,6 +748,7 @@ void MqttRTIambassador::modifyLookahead(LogicalTimeInterval const& theLookahead)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.regulating)
       throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");
@@ -750,6 +763,7 @@ void MqttRTIambassador::modifyLookahead(LogicalTimeInterval const& theLookahead)
 void MqttRTIambassador::queryLookahead(LogicalTimeInterval& interval)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    if (!_time.regulating)
       throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");

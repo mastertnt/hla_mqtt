@@ -22,6 +22,9 @@ OUT = ROOT / "src" / "rti1516e" / "generated"
 
 # RTIambassador services implemented by hand in MqttRTIambassador.cpp
 IMPLEMENTED = {
+    "requestFederationSave", "federateSaveBegun", "federateSaveComplete", "federateSaveNotComplete",
+    "abortFederationSave", "queryFederationSaveStatus", "requestFederationRestore", "federateRestoreComplete",
+    "federateRestoreNotComplete", "abortFederationRestore", "queryFederationRestoreStatus",
     "unconditionalAttributeOwnershipDivestiture",
     "negotiatedAttributeOwnershipDivestiture",
     "confirmDivestiture",

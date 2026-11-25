@@ -236,6 +236,7 @@ RegionHandle MqttRTIambassador::createRegion(DimensionHandleSet const& theDimens
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    Region region;
    for (DimensionHandle const& d : theDimensions)
@@ -255,6 +256,7 @@ void MqttRTIambassador::commitRegionModifications(RegionHandleSet const& theRegi
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::vector<std::pair<std::string, std::string>> records;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
@@ -274,6 +276,7 @@ void MqttRTIambassador::deleteRegion(RegionHandle const& theRegion)
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    std::uint64_t const r = ownRegion(theRegion);
    if (regionInUse(r))
@@ -287,6 +290,7 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstanceWithRegions(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    return registerObject(theClass, std::wstring(), &theAttributeHandleSetRegionHandleSetPairVector);
 }
 
@@ -296,6 +300,7 @@ ObjectInstanceHandle MqttRTIambassador::registerObjectInstanceWithRegions(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    return registerObject(theClass, theObjectInstanceName, &theAttributeHandleSetRegionHandleSetPairVector);
 }
 
@@ -318,6 +323,7 @@ void MqttRTIambassador::associateRegionsForUpdates(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::vector<std::pair<std::string, std::string>> records;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
@@ -347,6 +353,7 @@ void MqttRTIambassador::unassociateRegionsForUpdates(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    std::vector<std::pair<std::string, std::string>> records;
    {
       std::lock_guard<std::mutex> v(_viewMutex);
@@ -383,6 +390,7 @@ void MqttRTIambassador::subscribeObjectClassAttributesWithRegions(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const cls = ObjectClassHandleFriend::value(theClass);
@@ -410,6 +418,7 @@ void MqttRTIambassador::unsubscribeObjectClassAttributesWithRegions(
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const cls = ObjectClassHandleFriend::value(theClass);
@@ -442,6 +451,7 @@ void MqttRTIambassador::subscribeInteractionClassWithRegions(InteractionClassHan
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const cls = InteractionClassHandleFriend::value(theClass);
@@ -464,6 +474,7 @@ void MqttRTIambassador::unsubscribeInteractionClassWithRegions(InteractionClassH
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    {
       std::lock_guard<std::mutex> v(_viewMutex);
       std::uint64_t const cls = InteractionClassHandleFriend::value(theClass);
@@ -492,6 +503,7 @@ void MqttRTIambassador::sendInteractionWithRegions(InteractionClassHandle theInt
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, nullptr, &theRegionHandleSet);
 }
 
@@ -503,6 +515,7 @@ MessageRetractionHandle MqttRTIambassador::sendInteractionWithRegions(Interactio
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    return sendInteractionMessage(theInteraction, theParameterValues, theUserSuppliedTag, &theTime, &theRegionHandleSet);
 }
 
@@ -512,6 +525,7 @@ void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle
 {
    std::lock_guard<std::mutex> lock(_stateMutex);
    checkJoined();
+   checkNotSavingOrRestoring();
    AttributeHandleSet all;
    for (auto const& pair : theSet)
       all.insert(pair.first.begin(), pair.first.end());
@@ -522,6 +536,7 @@ void MqttRTIambassador::requestAttributeValueUpdateWithRegions(ObjectClassHandle
 DimensionHandleSet MqttRTIambassador::getDimensionHandleSet(RegionHandle theRegionHandle)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _regions.find(RegionHandleFriend::value(theRegionHandle));
    if (it == _regions.end())
@@ -535,6 +550,7 @@ DimensionHandleSet MqttRTIambassador::getDimensionHandleSet(RegionHandle theRegi
 RangeBounds MqttRTIambassador::getRangeBounds(RegionHandle theRegionHandle, DimensionHandle theDimensionHandle)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    auto it = _regions.find(RegionHandleFriend::value(theRegionHandle));
    if (it == _regions.end())
@@ -549,6 +565,7 @@ void MqttRTIambassador::setRangeBounds(RegionHandle theRegionHandle, DimensionHa
                                        RangeBounds const& theRangeBounds)
 {
    checkJoined();
+   checkNotSavingOrRestoring();
    std::lock_guard<std::mutex> v(_viewMutex);
    Region& region = _regions[ownRegion(theRegionHandle)];
    auto d = region.pending.find(DimensionHandleFriend::value(theDimensionHandle));

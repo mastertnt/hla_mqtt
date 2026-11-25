@@ -142,7 +142,7 @@ void MqttRTIambassador::handleDeclarations(std::string const& hexHandle, std::st
 
 void MqttRTIambassador::evaluateAdvisories()
 {
-   if (!_fdd || !_joined)
+   if (!_fdd || !_joined || _restoring)
       return;
    std::set<std::uint64_t> const live = liveFederateHandles();
 
@@ -280,7 +280,7 @@ void MqttRTIambassador::evaluateAdvisories()
 
 void MqttRTIambassador::evaluateScope(ObjectInstance& o)
 {
-   if (o.knownClass == 0)
+   if (o.knownClass == 0 || _restoring)
       return;
    if (!_advisorySwitches[2])
    {

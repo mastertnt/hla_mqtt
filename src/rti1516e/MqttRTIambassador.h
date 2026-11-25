@@ -391,6 +391,66 @@ private:
    void evaluateAllSync();                                                       // _viewMutex held
    std::set<std::uint64_t> liveFederateHandles() const;                         // _viewMutex held
 
+   // ------------------------------------ save and restore (MqttSaveRestore.cpp)
+   struct SaveMember
+   {
+      std::uint64_t handle = 0;
+      std::string clientId;
+   };
+   struct FederationSave // F/save/state and F/save/status/<federate>
+   {
+      bool active = false;
+      std::string id, label, raw; // raw: the state record (republished with "aborted")
+      bool timed = false;
+      TimeValue time;
+      std::uint64_t requester = 0;
+      std::vector<SaveMember> members;
+      bool aborted = false;
+      std::map<std::uint64_t, std::string> status; // begun, complete, notcomplete
+      bool member = false;
+      bool initiated = false; // initiateFederateSave delivered
+      SaveStatus local = NO_SAVE_IN_PROGRESS;
+      bool done = false;
+   };
+   struct RestoreMember
+   {
+      std::uint64_t handle = 0; // pre-restore
+      std::uint64_t saved = 0;  // post-restore
+      std::string clientId, name;
+   };
+   struct FederationRestore // F/restore/state and F/restore/status/<pre-restore federate>
+   {
+      bool active = false;
+      std::string id, label, saveId, raw;
+      std::uint64_t requester = 0;
+      std::vector<RestoreMember> members;
+      bool aborted = false;
+      std::map<std::uint64_t, std::string> status; // cleared, complete, notcomplete, failed, resigned
+      bool member = false;
+      std::uint64_t saved = 0;       // our post-restore handle
+      std::string federateRecord;    // our federate record before the restore
+      bool loading = false, loaded = false;
+      RestoreStatus local = NO_RESTORE_IN_PROGRESS;
+      bool done = false;
+   };
+   FederationSave _save;       // _viewMutex
+   FederationRestore _restore; // _viewMutex
+   bool _restoring = false;    // _viewMutex: object, ownership, time and advisory reactions suspended
+   std::atomic<bool> _saveBusy{false}, _restoreBusy{false}; // services refused (SaveInProgress, RestoreInProgress)
+   void checkNotSavingOrRestoring() const;
+   bool claimExclusive(std::string const& base, std::string const& stateTopic); // no lock held
+   void handleSaveTraffic(std::string const& rest, std::string const& payload);    // _viewMutex held
+   void handleRestoreTraffic(std::string const& rest, std::string const& payload); // _viewMutex held
+   void evaluateSave();    // _viewMutex held
+   void evaluateRestore(); // _viewMutex held
+   void finishRestore(bool success, RestoreFailureReason reason); // _viewMutex held
+   void loadRestoredState(std::string const& id); // federate thread (internal queue entry)
+   Json federateSnapshot() const;                 // _viewMutex held
+   void loadSnapshot(Json const& state);          // _viewMutex held
+   void clearOwnRecords(bool handleChanges);      // _viewMutex held, async
+   void republishOwnRecords();                    // _viewMutex held, async
+   bool momClassObject(ObjectInstance const& o) const;
+
    // -------------------------------------- jalon 4: time management (MqttTime.cpp)
    enum class Advance
    {
