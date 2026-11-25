@@ -447,7 +447,8 @@ void MqttRTIambassador::handleOwnershipMessage(std::uint64_t to, std::string con
             continue;
          if (won.count(a))
          {
-            byTag[acq->second.tag].insert(a);
+            if (!acq->second.silent)
+               byTag[acq->second.tag].insert(a);
             o.acquiring.erase(acq);
          }
          else if (acq->second.cancelling)
@@ -478,12 +479,23 @@ void MqttRTIambassador::handleOwnershipMessage(std::uint64_t to, std::string con
    else if (kind == "request")
    {
       bool const ifAvailable = m["ifAvailable"].boolean();
-      std::set<std::uint64_t> notOwned, unavailable, release, confirm;
+      bool const forced = m["force"].boolean();
+      std::set<std::uint64_t> notOwned, unavailable, release, confirm, seized;
       for (std::uint64_t a : attrs)
       {
          if (!o.owned.count(a))
          {
             notOwned.insert(a);
+            continue;
+         }
+         if (forced) // HLAmodifyAttributeState: divested at once, without callback
+         {
+            std::vector<OwnershipRequest>& queue = o.requests[a];
+            queue.erase(std::remove_if(queue.begin(), queue.end(),
+                                       [from](OwnershipRequest const& r) { return r.federate == from; }),
+                        queue.end());
+            queue.insert(queue.begin(), OwnershipRequest{from, false});
+            seized.insert(a);
             continue;
          }
          if (ifAvailable && !o.offered.count(a))
@@ -499,6 +511,8 @@ void MqttRTIambassador::handleOwnershipMessage(std::uint64_t to, std::string con
       }
       if (!notOwned.empty())
          sendOwnership(from, ownershipMessage("notowned", instance, notOwned));
+      if (!seized.empty())
+         grant(o, seized);
       if (!unavailable.empty())
          sendOwnership(from, ownershipMessage("unavailable", instance, unavailable));
       if (!confirm.empty())
@@ -542,11 +556,13 @@ void MqttRTIambassador::handleOwnershipMessage(std::uint64_t to, std::string con
       {
          auto acq = o.acquiring.find(a);
          std::string const tag = acq == o.acquiring.end() ? std::string() : acq->second.tag;
+         bool const silent = acq != o.acquiring.end() && acq->second.silent;
          if (acq != o.acquiring.end())
             o.acquiring.erase(acq);
          o.claims.erase(a);
          o.owned.insert(a);
-         byTag[tag].insert(a);
+         if (!silent)
+            byTag[tag].insert(a);
       }
       publishOwnerRecord(o);
       for (auto const& kv : byTag)
@@ -625,7 +641,8 @@ bool MqttRTIambassador::driveAcquisitions(ObjectInstance& o)
 {
    if (o.acquiring.empty())
       return false;
-   std::map<std::tuple<std::uint64_t, bool, std::string>, std::set<std::uint64_t>> asks; // (owner, ifAvailable, tag)
+   // (owner, ifAvailable, tag, forced) -> attributes
+   std::map<std::tuple<std::uint64_t, bool, std::string, bool>, std::set<std::uint64_t>> asks;
    std::set<std::uint64_t> claimNow;
    auto records = _ownerRecords.find(o.handle);
    for (auto& kv : o.acquiring)
@@ -642,7 +659,7 @@ bool MqttRTIambassador::driveAcquisitions(ObjectInstance& o)
          if (acq.askedTo != owner)
          {
             acq.askedTo = owner;
-            asks[std::make_tuple(owner, acq.ifAvailable, acq.tag)].insert(a);
+            asks[std::make_tuple(owner, acq.ifAvailable, acq.tag, acq.forced)].insert(a);
          }
          continue;
       }
@@ -660,6 +677,8 @@ bool MqttRTIambassador::driveAcquisitions(ObjectInstance& o)
       Json m = ownershipMessage("request", o.handle, kv.second);
       m.set("ifAvailable", std::get<1>(kv.first));
       m.set("tag", std::get<2>(kv.first));
+      if (std::get<3>(kv.first))
+         m.set("force", true);
       sendOwnership(std::get<0>(kv.first), m);
    }
    if (claimNow.empty())
@@ -854,6 +873,50 @@ void MqttRTIambassador::ownershipPresenceLost(std::string const& clientId)
    evaluateAdvisories();
 }
 
+// MOM HLAmodifyAttributeState (11.4): ownership given to or taken from this
+// federate, without notification to either federate.
+std::wstring MqttRTIambassador::momModifyAttributeState(std::uint64_t instance, std::uint64_t attribute, bool owned)
+{
+   auto it = _objects.find(instance);
+   if (it == _objects.end() || it->second.knownClass == 0)
+      return L"object instance not known by the federate";
+   ObjectInstance& o = it->second;
+   if (!_fdd->classHasAttribute(o.knownClass, attribute))
+      return L"attribute not defined for the known class of the object instance";
+   Fdd::ObjectClass const* c = _fdd->objectClass(o.objectClass);
+   if (o.mom || (c && startsWith(c->qualified, "HLAobjectRoot.HLAmanager")))
+      return L"attribute owned by the RTI";
+   if (!owned)
+   {
+      if (!o.owned.count(attribute))
+         return std::wstring(); // already not owned by this federate
+      o.owned.erase(attribute);
+      o.offered.erase(attribute);
+      o.relevant.erase(attribute);
+      o.updateRegions.erase(attribute);
+      o.order.erase(attribute);
+      o.transport.erase(attribute);
+      o.requests.erase(attribute); // the requesters see it unowned and claim it
+      publishOwnerRecord(o);
+      evaluateAdvisories();
+      return std::wstring();
+   }
+   auto pub = _publishedAttributes.find(o.knownClass);
+   if (pub == _publishedAttributes.end() || !pub->second.count(attribute))
+      return L"attribute not published by the federate at the known class";
+   if (o.owned.count(attribute))
+      return std::wstring();
+   bool const existed = o.acquiring.count(attribute) != 0;
+   Acquisition& acq = o.acquiring[attribute];
+   if (!existed)
+      acq.silent = true; // otherwise the federate's own acquisition is notified as usual
+   acq.forced = true;
+   acq.ifAvailable = false;
+   acq.askedTo = 0; // asked again, forced
+   driveAcquisitions(o);
+   return std::wstring();
+}
+
 // ================================================================ services
 MqttRTIambassador::ObjectInstance& MqttRTIambassador::ownershipObject(ObjectInstanceHandle const& h,
                                                                       AttributeHandleSet const& attrs,
@@ -965,6 +1028,7 @@ void MqttRTIambassador::attributeOwnershipAcquisition(ObjectInstanceHandle theOb
       acq.ifAvailable = false;
       acq.tag = tag;
       acq.cancelling = false;
+      acq.silent = false;
    }
    driveAcquisitions(o);
 }
@@ -1075,7 +1139,7 @@ void MqttRTIambassador::cancelAttributeOwnershipAcquisition(ObjectInstanceHandle
    for (std::uint64_t a : attrs)
    {
       auto acq = o.acquiring.find(a);
-      if (acq == o.acquiring.end() || acq->second.ifAvailable || acq->second.cancelling)
+      if (acq == o.acquiring.end() || acq->second.ifAvailable || acq->second.cancelling || acq->second.silent)
          throw AttributeAcquisitionWasNotRequested(AttributeHandleFriend::create(a).toString());
    }
    cancelAcquisitions(o, attrs, true);

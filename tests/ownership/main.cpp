@@ -2,8 +2,8 @@
 // between ambassadors in one process: unconditional and negotiated
 // divestiture, acquisition (with and without "if available"), release
 // denied, divestiture if wanted, cancellations, queries, concurrent
-// acquisitions of an unowned attribute, the delete privilege, resign actions
-// and the loss of an owner. Needs a broker.
+// acquisitions of an unowned attribute, the delete privilege, resign actions,
+// the loss of an owner and the MOM HLAmodifyAttributeState. Needs a broker.
 //
 //   hla-ownership-test [--broker mqtt://host:1883]
 //
@@ -15,6 +15,8 @@
 
 #include <RTI/NullFederateAmbassador.h>
 #include <RTI/RTI1516.h>
+#include <RTI/encoding/BasicDataElements.h>
+#include <RTI/encoding/HLAopaqueData.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -65,6 +67,13 @@ VariableLengthData text(std::string const& s)
    return VariableLengthData(s.data(), s.size());
 }
 
+template <class H>
+VariableLengthData encHandle(H const& h) // HLAhandle
+{
+   VariableLengthData const e = h.encode();
+   return HLAopaqueData(static_cast<Octet const*>(e.data()), e.size()).encode();
+}
+
 std::string str(VariableLengthData const& d)
 {
    return d.size() ? std::string(static_cast<char const*>(d.data()), d.size()) : std::string();
@@ -87,6 +96,7 @@ struct Federate : NullFederateAmbassador
    std::set<ObjectInstanceHandle> removed;
    std::map<ObjectInstanceHandle, AttributeHandleValueMap> values;
    std::vector<Event> events;
+   std::vector<InteractionClassHandle> interactions;
 
    explicit Federate(std::string const& clientId)
    {
@@ -134,6 +144,12 @@ struct Federate : NullFederateAmbassador
    {
       for (auto const& kv : v)
          values[o][kv.first] = kv.second;
+   }
+
+   void receiveInteraction(InteractionClassHandle c, ParameterHandleValueMap const&, VariableLengthData const&,
+                           OrderType, TransportationType, SupplementalReceiveInfo) RTI_THROW((FederateInternalError)) override
+   {
+      interactions.push_back(c);
    }
 
    // -------------------------------------------------------- ownership
@@ -510,6 +526,48 @@ int main(int argc, char** argv)
       ra.attributeOwnershipAcquisitionIfAvailable(v2, onlyName);
       check(pump(ac, [&] { return a.find("acquired", ma3, &onlyName) >= 0; }),
             "the attribute of the lost owner is acquired again");
+
+      // ------------------------------------- MOM HLAmodifyAttributeState
+      {
+         InteractionClassHandle const modify =
+            ra.getInteractionClassHandle(L"HLAmanager.HLAfederate.HLAadjust.HLAmodifyAttributeState");
+         InteractionClassHandle const momExc =
+            ra.getInteractionClassHandle(L"HLAmanager.HLAfederate.HLAreport.HLAreportMOMexception");
+         ra.publishInteractionClass(modify);
+         ra.subscribeInteractionClass(momExc);
+         settleAll(ac, 0.3);
+         auto sendModify = [&](FederateHandle target, AttributeHandle attribute, int state) {
+            ParameterHandleValueMap pv;
+            pv[ra.getParameterHandle(modify, L"HLAfederate")] = encHandle(target);
+            pv[ra.getParameterHandle(modify, L"HLAobjectInstance")] = encHandle(v2);
+            pv[ra.getParameterHandle(modify, L"HLAattribute")] = encHandle(attribute);
+            pv[ra.getParameterHandle(modify, L"HLAattributeState")] = HLAinteger32BE(state).encode();
+            ra.sendInteraction(modify, pv, text(""));
+         };
+         size_t const ea = a.events.size(), ec = c.events.size();
+         sendModify(hc, pos, 1);
+         check(pump(ac, [&] { return rc.isAttributeOwnedByFederate(v2, pos); }),
+               "HLAmodifyAttributeState owned: C takes Position from its owner A");
+         check(!ra.isAttributeOwnedByFederate(v2, pos), "A no longer owns Position");
+         settleAll(ac, 0.3);
+         check(a.events.size() == ea && c.events.size() == ec, "no ownership callback at A or C");
+         check(ownerBecomes(a, ac, v2, pos, "owner", hc), "A sees C as owner of Position");
+         sendModify(hc, pos, 0);
+         check(pump(ac, [&] { return !rc.isAttributeOwnedByFederate(v2, pos); }),
+               "HLAmodifyAttributeState unowned: C releases Position");
+         check(ownerBecomes(a, ac, v2, pos, "notowned"), "Position unowned");
+         size_t const ia = a.interactions.size();
+         sendModify(hc, priv, 1); // not published by C
+         check(pump(ac, [&] {
+                  for (size_t i = ia; i < a.interactions.size(); ++i)
+                     if (a.interactions[i] == momExc)
+                        return true;
+                  return false;
+               }),
+               "attribute not published by the target -> HLAreportMOMexception");
+         check(ra.isAttributeOwnedByFederate(v2, priv) && !rc.isAttributeOwnedByFederate(v2, priv),
+               "the failed modification has no effect");
+      }
 
       rc.resignFederationExecution(CANCEL_THEN_DELETE_THEN_DIVEST);
       ra.resignFederationExecution(CANCEL_THEN_DELETE_THEN_DIVEST);

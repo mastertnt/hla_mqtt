@@ -259,6 +259,10 @@ est le fédéré vivant dont l'enregistrement le liste ; aucun : l'attribut est 
   enregistrement.
 - **Requêtes** : `queryAttributeOwnership` répond `informAttributeOwnership`, `attributeIsNotOwned`, ou
   `attributeIsOwnedByRTI` pour les objets MOM. `requestAttributeValueUpdate` est envoyé à chaque propriétaire.
+- **MOM `HLAmodifyAttributeState`** : le fédéré visé prend l'attribut (demande forcée : le propriétaire le
+  cède aussitôt, sans callback de part et d'autre ; attribut sans propriétaire : revendiqué) ou le lâche
+  (sans propriétaire). Objet inconnu, attribut non publié à la classe connue ou attribut MOM :
+  `HLAreportMOMexception`, sans effet.
 
 ### Points de synchronisation
 
@@ -281,7 +285,7 @@ Le label est réservé comme un nom de fédération (réservation + barrière). 
 - **HLAmanager.HLAfederation** : construite localement par chaque fédéré à partir des enregistrements retenus (exécution, modules FOM, fédérés) ; découverte dès que la classe est souscrite, réfléchie sur requête. `HLAcurrentFDD` contient les modules fusionnés (MIM en tête).
 - **Interactions HLArequest, HLAadjust, HLAservice** : chaque fédéré reçoit ces interactions (abonnements internes) et traite celles dont `HLAfederate` est son handle ; le fédéré n'a pas à publier les rapports. Les services `HLAservice` s'exécutent sur le thread du fédéré, au prochain `evokeCallback` (ou par le dispatcher en `HLA_IMMEDIATE`) ; un échec produit `HLAreportMOMexception`. Les requêtes de niveau fédération (points de synchronisation, modules FOM, MIM) sont traitées par le fédéré vivant de plus petit handle, qui envoie aussi `HLAreportFederateLost` quand un fédéré disparaît sans resign.
 - `HLAsetSwitches` : `conveyProducingFederate` renseigne le fédéré producteur dans les informations supplémentaires de `reflectAttributeValues` et `receiveInteraction` ; `conveyRegionDesignatorSets` est seulement mémorisé. `HLAsetExceptionReporting` signale les exceptions levées par les callbacks du fédéré.
-- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré) ; `HLAmodifyAttributeState` et les services de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
+- Limites : `HLAreportServiceInvocation` ne couvre que les services invoqués par `HLAservice` (pas les appels directs du fédéré)  ; les services de sauvegarde/restauration répondent `HLAreportMOMexception` (non implémentés) ; les attributs de sauvegarde de `HLAfederation` sont vides.
 
 ## Client de test
 
@@ -300,7 +304,7 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-time-test` (broker requis) couvre les points de synchronisation (ensemble complet ou explicite, label non unique, membre absent, membre disparu, réutilisation du label) et la gestion du temps : activation, livraison TSO ordonnée, borne d'envoi, messages RO retenus, livraison asynchrone, régulateur tardif, boucle TAR à lookahead 1 et boucle NER à lookahead nul entre deux fédérés, NER sans message résolu par la coupe cohérente, `retract` (avant et après livraison, trop tard) et changement d'ordre des attributs et interactions.
 `hla-ddm-test` (broker requis) couvre création, bornes, validation et suppression de régions, régions d'un autre fédéré, enregistrement avec régions, association et dissociation, abonnements d'objets et d'interactions avec régions et leur coexistence avec l'abonnement sans région, puis le filtrage par recouvrement (déplacement des régions de mise à jour et d'abonnement), les avis de portée et de pertinence, `sendInteractionWithRegions` et `requestAttributeValueUpdateWithRegions`.
 `hla-mom-test` (broker requis) couvre le MIM standard (classes, dimensions, remplacement par un MIM explicite), la découverte et les valeurs des objets `HLAfederate` et `HLAfederation`, les requêtes et rapports (publications, mises à jour envoyées, informations d'instance, modules FOM, points de synchronisation, MIM), `HLAsetTiming`, `HLAsetSwitches`, les rapports d'invocation et d'exception, les services `HLAservice` (succès, échec, paramètre indécodable) et `HLAreportFederateLost`.
-`hla-ownership-test` (broker requis) couvre les services de propriété entre trois fédérés : requêtes (dont `attributeIsOwnedByRTI` pour un objet MOM), exceptions, cession inconditionnelle, acquisitions simultanées d'un attribut sans propriétaire (un seul gagnant, l'autre devient une demande au gagnant), cession négociée et confirmation, acquisition « si disponible », refus et annulations, `attributeOwnershipDivestitureIfWanted`, transfert du privilège de suppression puis suppression par le nouveau détenteur, actions de resign, perte d'un propriétaire sans resign.
+`hla-ownership-test` (broker requis) couvre les services de propriété entre trois fédérés : requêtes (dont `attributeIsOwnedByRTI` pour un objet MOM), exceptions, cession inconditionnelle, acquisitions simultanées d'un attribut sans propriétaire (un seul gagnant, l'autre devient une demande au gagnant), cession négociée et confirmation, acquisition « si disponible », refus et annulations, `attributeOwnershipDivestitureIfWanted`, transfert du privilège de suppression puis suppression par le nouveau détenteur, actions de resign, perte d'un propriétaire sans resign, `HLAmodifyAttributeState` (prise, abandon, erreur).
 `hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
@@ -344,7 +348,7 @@ ctest --preset conan-release --output-on-failure
 
 ## Suite prévue
 
-- Sauvegarde/restauration (et sa partie MOM), `HLAmodifyAttributeState`.
+- Sauvegarde/restauration (et sa partie MOM).
 
 ---
 Headers : *Reprinted with permission from IEEE 1516.1(TM)-2010.*

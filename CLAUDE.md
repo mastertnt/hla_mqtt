@@ -101,8 +101,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - **MOM, issues #34 à #37** (2026-11-25) : MIM standard fusionné à la création, objets HLAfederate (un par
   fédéré, valeurs calculées) et HLAfederation (locale), HLArequest/HLAreport, HLAadjust, HLAservice (file
   interne hors portée de callback), HLAreportFederateLost. `hla-mom-test` 50/50 (4 exécutions), suite verte.
-  Rapport d'invocation limité aux services MOM ; HLAmodifyAttributeState et sauvegarde répondent
-  HLAreportMOMexception.
+  Rapport d'invocation limité aux services MOM ; la sauvegarde répond HLAreportMOMexception.
 - **Robustesse, issues #38 et #3** (2026-11-25) : reconnexion automatique (`reconnect`, défaut 30 s ; session
   propre, réabonnement + barrière, resynchronisation de la vue, republication des info d'objets), effacement
   des présences offline après `staleClientDelay`. `hla-robustness-test` 13/13, suite verte.
@@ -111,6 +110,7 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   `F/ownership/<fédéré>` et `.../all` ; revendication des attributs sans propriétaire par marqueur
   (barrière). Tous les services et callbacks du chapitre 7, resign complet (`MqttOwnership.cpp`).
   `hla-ownership-test` 63/63 (9 exécutions, Release et Debug), suite complète verte (9/9).
+  HLAmodifyAttributeState depuis (demande forcée et silencieuse) : `hla-ownership-test` 71/71.
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 

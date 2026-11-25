@@ -133,6 +133,8 @@ private:
       std::string tag;
       std::uint64_t askedTo = 0; // owner the request was sent to (0: none)
       bool cancelling = false;
+      bool forced = false; // HLAmodifyAttributeState: the owner divests at once
+      bool silent = false; // no callback when acquired (not requested by the federate)
    };
    struct ObjectInstance
    {
@@ -191,6 +193,8 @@ private:
    void divest(ObjectInstance& o, std::set<std::uint64_t> const& attrs); // unconditional
    void cancelAcquisitions(ObjectInstance& o, std::set<std::uint64_t> const& attrs, bool notify);
    void ownershipPresenceLost(std::string const& clientId);
+   // MOM HLAmodifyAttributeState; returns the error to report (empty: done).
+   std::wstring momModifyAttributeState(std::uint64_t instance, std::uint64_t attribute, bool owned);
    ObjectInstance& ownershipObject(ObjectInstanceHandle const& h, AttributeHandleSet const& attrs,
                                    std::set<std::uint64_t>& values); // known object, defined attributes
 

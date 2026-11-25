@@ -24,8 +24,8 @@
 // this library.
 //
 // Limits: HLAreportServiceInvocation covers the services invoked through
-// HLAservice interactions only; HLAmodifyAttributeState and the save and
-// restore services answer HLAreportMOMexception (not implemented).
+// HLAservice interactions only; the save and restore services answer
+// HLAreportMOMexception (not implemented).
 
 #include "MqttRTIambassador.h"
 
@@ -1105,7 +1105,13 @@ void MqttRTIambassador::momAdjust(std::string const& name, std::uint64_t cls,
          _conveyProducingFederate = decInt(p("HLAconveyProducingFederate")) == 1;
    }
    else if (name == "HLAmodifyAttributeState")
-      momException(L"HLAmodifyAttributeState", L"HLAmodifyAttributeState is not implemented by this RTI", false);
+   {
+      std::wstring const error = momModifyAttributeState(decHandle(p("HLAobjectInstance")),
+                                                         decHandle(p("HLAattribute")),
+                                                         decInt(p("HLAattributeState")) == 1);
+      if (!error.empty())
+         throw MomParameterError{error};
+   }
    else
       throw MomParameterError{L"adjustment not handled by this RTI"};
 }
