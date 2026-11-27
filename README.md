@@ -51,10 +51,13 @@ tests/settings/         hla-settings-test : configuration (désignateur, fichier
 tests/tls/              hla-tls-test : connexions TLS (broker TLS requis, sinon ignoré)
 config/                 exemple de fichier de configuration
 tests/robustness/       hla-robustness-test : reconnexion, présences périmées
+tests/load/             hla-load : un fédéré par processus, charge et performances (LoadFom.xml)
+conformance/openrti/    tests d'OpenRTI compilés contre ce RTI (conformance/README.md)
 mim/HLAstandardMIM.xml  MIM standard IEEE 1516.1-2010, intégré à la DLL (cmake/EmbedFile.cmake)
 tools/
   gen_rti_sources.py    régénère generated/ à partir des headers
   check_imports.py      compare les imports d'un fédéré aux exports de la DLL (Windows)
+  hla_load.py           lance des processus hla-load : test de charge (run), banc de performance (bench)
   pe_linker_version.cpp hla-pe-linker-version : version d'éditeur de liens PE (VR-Link)
 profiles/conan1/        profils Conan 1.66 (vs2019-release, vs2019-debug)
 profiles/conan2/        profils Conan 2 (vs2019, linux-gcc)
@@ -102,6 +105,8 @@ broker\watch-hla.bat        :: affiche le trafic hla/#
 ```
 
 Avec Docker : `docker compose -f broker/docker-compose.yml up`.
+
+La file d'un client lent est bornée par le broker. Au-delà, Mosquitto jette les messages QoS 1, ce qui fait perdre des mises à jour « reliable » sans que le RTI le sache. La limite par défaut de Mosquitto, `max_queued_messages 1000`, suffit à un échange courant mais pas aux grosses rafales (banc de performance). `broker/mosquitto-hla.conf` la porte à 100 000 ; un broker de production doit être dimensionné de même.
 
 ### Options
 
@@ -315,7 +320,7 @@ est le fédéré vivant dont l'enregistrement le liste ; aucun : l'attribut est 
 
 ### Points de synchronisation
 
-Le label est réservé comme un nom de fédération (réservation + barrière). Chaque membre décide seul que le point est synchronisé : tous les membres l'ont atteint ou ont quitté la fédération. Le déclarant efface ensuite les enregistrements, ce qui libère le label. L'ensemble est figé à la déclaration (fédérés joints, ou l'ensemble donné) : un fédéré qui joint après n'en fait pas partie.
+Le label est réservé comme un nom de fédération (réservation + barrière). Chaque membre décide seul que le point est synchronisé : tous les membres l'ont atteint ou ont quitté la fédération. Le déclarant efface ensuite les enregistrements, ce qui libère le label. Avec un ensemble donné, celui-ci est figé. Sans ensemble, le point concerne toute la fédération : les fédérés joints à la déclaration, plus ceux qui joignent avant la synchronisation. Ceux-ci trouvent l'enregistrement retenu du point et reçoivent l'annonce, comme avec OpenRTI. Un tel fédéré qui voit les enregistrements effacés avant d'avoir conclu (il a joint pendant que les autres concluaient) reçoit `federationSynchronized`.
 
 ### Gestion du temps
 
@@ -360,6 +365,9 @@ hla-test-federate --settings "mqtt://localhost:1883;keepAlive=2" --model evoked 
 `hla-robustness-test` (broker requis) coupe la connexion d'un fédéré en reprenant son clientId avec un client MQTT brut : reconnexion sans `connectionLost`, redécouverte de ses objets par les autres, mises à jour dans les deux sens, objet supprimé pendant la coupure ; `reconnect=0` ; présence `offline` d'un processus tué effacée après `staleClientDelay`.
 `hla-objects-test` (broker requis) couvre découverte, réflexion filtrée, abonné tardif, interactions, variantes horodatées, réservation de noms, requêtes de mise à jour, suppression locale et redécouverte, fédéré disparu, actions de resign, changement et requête de transport (attributs et interactions), taux de mise à jour, et 1000 mises à jour reçues dans l'ordre.
 
+`multiprocess` et `multiprocess-pingpong` (label `multiprocess`, broker et Python 3 requis) lancent `tools/hla_load.py run`. Le premier démarre 6 processus `hla-load`, un fédéré chacun, qui enregistrent chacun 10 objets et les mettent à jour 15 fois (8 attributs). Chaque fédéré vérifie qu'il a découvert les objets des autres et reçu chacune de leurs mises à jour une seule fois et dans l'ordre. Le second mesure des allers-retours d'interactions entre 3 processus. Voir [Charge et performances](#charge-et-performances).
+La suite de conformité (tests d'OpenRTI, label `openrti`) est décrite dans [conformance/README.md](conformance/README.md).
+
 Résultat attendu :
 
 ```
@@ -371,6 +379,25 @@ Résultat attendu :
 ...
 ALL TESTS PASSED (0 failure(s))
 ```
+
+## Charge et performances
+
+`hla-load` est un fédéré par processus. Tous les processus d'un essai partagent le nom de fédération et le nombre total de fédérés N. Le fédéré d'indice 0 attend de découvrir les N objets MOM `HLAfederate`, puis conduit les points de synchronisation. `tools/hla_load.py` lance les processus et contrôle leurs résultats :
+
+```bat
+:: 8 fédérés sur cette machine
+python tools\hla_load.py run --exe buildin\Release\hla-load.exe --federates 8 --objects 50 --updates 100
+
+:: 2 machines, 4 fédérés chacune, même broker
+python tools\hla_load.py run --exe ... --settings mqtt://broker:1883 --federation Big --total 8 --first 0 --federates 4
+python tools\hla_load.py run --exe ... --settings mqtt://broker:1883 --federation Big --total 8 --first 4 --federates 4
+
+:: banc de performance (docs/performance.md)
+python tools\hla_load.py bench --exe buildin\Release\hla-load.exe --markdown perf.md
+```
+
+Le broker doit accepter des files longues (`max_queued_messages`, voir [Broker MQTT](#broker-mqtt)). Sinon `hla-load` signale des mises à jour manquantes.
+Les résultats mesurés sont dans [docs/performance.md](docs/performance.md).
 
 ## Intégration continue
 

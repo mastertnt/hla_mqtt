@@ -63,7 +63,8 @@ std::string normalizeTransportation(std::string const& raw)
    return t;
 }
 
-// 2010: <dimensions><dimension>X</dimension></dimensions>; 2000: dimensions="X, Y" or "NA".
+// 2010: <dimensions><dimension>X</dimension></dimensions>; 2000: dimensions="X, Y",
+// "X Y" or "NA".
 std::vector<std::string> readDimensionList(XmlElement const& e)
 {
    std::vector<std::string> out;
@@ -85,13 +86,13 @@ std::vector<std::string> readDimensionList(XmlElement const& e)
          size_t start = 0;
          while (start <= s.size())
          {
-            size_t comma = s.find(',', start);
-            if (comma == std::string::npos)
-               comma = s.size();
-            std::string const n = trim(s.substr(start, comma - start));
+            size_t sep = s.find_first_of(", \t\r\n", start);
+            if (sep == std::string::npos)
+               sep = s.size();
+            std::string const n = trim(s.substr(start, sep - start));
             if (!n.empty() && n != "NA")
                out.push_back(n);
-            start = comma + 1;
+            start = sep + 1;
          }
       }
    }
@@ -108,6 +109,12 @@ void checkCollision(Map const& map, std::uint64_t handle, std::string const& qua
       inconsistent(label, "handle collision between '" + qualified + "' and '" + it->second.qualified + "'");
 }
 } // namespace
+
+// The root class and the MOM classes (HLAmanager subtree).
+bool isStandardClass(std::string const& qualified, std::string const& root)
+{
+   return qualified == root || qualified.compare(0, root.size() + 10, root + ".HLAmanager") == 0;
+}
 
 struct FddBuilder
 {
@@ -127,7 +134,15 @@ struct FddBuilder
       if (parent == nullptr)
       {
          if (name != kObjectRoot)
-            reading(label, "top-level object class must be HLAobjectRoot, not '" + name + "'");
+         {
+            // Module without the root (tolerated, like other RTIs): the
+            // class is a child of HLAobjectRoot, known from the MIM.
+            auto root = fdd._objectClassByName.find(kObjectRoot);
+            if (root == fdd._objectClassByName.end())
+               reading(label, "top-level object class must be HLAobjectRoot, not '" + name + "'");
+            objectClass(e, &fdd._objectClasses[root->second]);
+            return;
+         }
          qualified = kObjectRoot;
       }
       else
@@ -148,7 +163,30 @@ struct FddBuilder
          fdd._objectClassByName[qualified] = handle;
       }
 
-      for (XmlElement const* a : e.childrenNamed("attribute"))
+      std::vector<XmlElement const*> const attributes = e.childrenNamed("attribute");
+      if (!attributes.empty() && !isStandardClass(qualified, kObjectRoot))
+      {
+         // IEEE 1516.2-2010: a class defined (with attributes) in several
+         // modules has the same definition in each; a module naming it
+         // without attributes is a scaffolding definition. Not applied to
+         // the root and MOM classes, which IEEE 1516-2000 FOMs extend
+         // (privilegeToDelete next to HLAprivilegeToDeleteObject).
+         if (!c.definedBy.empty())
+         {
+            std::vector<std::string> mine, theirs;
+            for (XmlElement const* a : attributes)
+               mine.push_back(a->value("name"));
+            for (std::uint64_t h : c.attributes)
+               theirs.push_back(fdd._attributes[h].name);
+            std::sort(mine.begin(), mine.end());
+            std::sort(theirs.begin(), theirs.end());
+            if (mine != theirs)
+               inconsistent(label, "object class " + qualified + " defined with other attributes in " + c.definedBy);
+         }
+         else
+            c.definedBy = label;
+      }
+      for (XmlElement const* a : attributes)
          attribute(*a, c);
       for (XmlElement const* sub : e.childrenNamed("objectClass"))
          objectClass(*sub, &fdd._objectClasses[handle]);
@@ -203,7 +241,13 @@ struct FddBuilder
       if (parent == nullptr)
       {
          if (name != kInteractionRoot)
-            reading(label, "top-level interaction class must be HLAinteractionRoot, not '" + name + "'");
+         {
+            auto root = fdd._interactionClassByName.find(kInteractionRoot);
+            if (root == fdd._interactionClassByName.end())
+               reading(label, "top-level interaction class must be HLAinteractionRoot, not '" + name + "'");
+            interactionClass(e, &fdd._interactionClasses[root->second]);
+            return;
+         }
          qualified = kInteractionRoot;
       }
       else
@@ -241,7 +285,26 @@ struct FddBuilder
          c.transportationSet = true;
       }
 
-      for (XmlElement const* p : e.childrenNamed("parameter"))
+      std::vector<XmlElement const*> const parameters = e.childrenNamed("parameter");
+      if (!parameters.empty() && !isStandardClass(qualified, kInteractionRoot))
+      {
+         if (!c.definedBy.empty())
+         {
+            std::vector<std::string> mine, theirs;
+            for (XmlElement const* p : parameters)
+               mine.push_back(p->value("name"));
+            for (std::uint64_t h : c.parameters)
+               theirs.push_back(fdd._parameters[h].name);
+            std::sort(mine.begin(), mine.end());
+            std::sort(theirs.begin(), theirs.end());
+            if (mine != theirs)
+               inconsistent(label,
+                            "interaction class " + qualified + " defined with other parameters in " + c.definedBy);
+         }
+         else
+            c.definedBy = label;
+      }
+      for (XmlElement const* p : parameters)
          parameter(*p, c);
       for (XmlElement const* sub : e.childrenNamed("interactionClass"))
          interactionClass(*sub, &fdd._interactionClasses[handle]);
@@ -408,6 +471,25 @@ static typename Map::mapped_type const* findIn(Map const& m, std::uint64_t h)
    return it == m.end() ? nullptr : &it->second;
 }
 
+// Qualified name -> handle: the only class whose qualified name ends with
+// "." + name (0 when none or several).
+static std::uint64_t uniqueSuffix(std::map<std::string, std::uint64_t> const& byName, std::string const& name)
+{
+   if (name.empty())
+      return 0;
+   std::string const suffix = "." + name;
+   std::uint64_t found = 0;
+   for (auto const& kv : byName)
+      if (kv.first.size() > suffix.size() &&
+          kv.first.compare(kv.first.size() - suffix.size(), suffix.size(), suffix) == 0)
+      {
+         if (found != 0)
+            return 0;
+         found = kv.second;
+      }
+   return found;
+}
+
 Fdd::ObjectClass const* Fdd::objectClass(std::uint64_t handle) const
 {
    return findIn(_objectClasses, handle);
@@ -418,7 +500,9 @@ Fdd::ObjectClass const* Fdd::objectClassByName(std::string const& name) const
    auto it = _objectClassByName.find(name);
    if (it == _objectClassByName.end())
       it = _objectClassByName.find(kObjectRoot + "." + name);
-   return it == _objectClassByName.end() ? nullptr : objectClass(it->second);
+   if (it != _objectClassByName.end())
+      return objectClass(it->second);
+   return objectClass(uniqueSuffix(_objectClassByName, name));
 }
 
 Fdd::Attribute const* Fdd::attribute(std::uint64_t handle) const
@@ -432,6 +516,18 @@ Fdd::Attribute const* Fdd::findAttribute(std::uint64_t classHandle, std::string 
       for (std::uint64_t h : c->attributes)
          if (_attributes.at(h).name == name)
             return &_attributes.at(h);
+   // Qualified by its declaring class.
+   size_t const dot = name.rfind('.');
+   if (dot == std::string::npos)
+      return nullptr;
+   ObjectClass const* declaring = objectClassByName(name.substr(0, dot));
+   if (declaring == nullptr)
+      return nullptr;
+   for (ObjectClass const* c = objectClass(classHandle); c; c = c->parent ? objectClass(c->parent) : nullptr)
+      if (c == declaring)
+         for (std::uint64_t h : c->attributes)
+            if (_attributes.at(h).name == name.substr(dot + 1))
+               return &_attributes.at(h);
    return nullptr;
 }
 
@@ -453,7 +549,9 @@ Fdd::InteractionClass const* Fdd::interactionClassByName(std::string const& name
    auto it = _interactionClassByName.find(name);
    if (it == _interactionClassByName.end())
       it = _interactionClassByName.find(kInteractionRoot + "." + name);
-   return it == _interactionClassByName.end() ? nullptr : interactionClass(it->second);
+   if (it != _interactionClassByName.end())
+      return interactionClass(it->second);
+   return interactionClass(uniqueSuffix(_interactionClassByName, name));
 }
 
 Fdd::Parameter const* Fdd::parameter(std::uint64_t handle) const
@@ -468,6 +566,18 @@ Fdd::Parameter const* Fdd::findParameter(std::uint64_t classHandle, std::string 
       for (std::uint64_t h : c->parameters)
          if (_parameters.at(h).name == name)
             return &_parameters.at(h);
+   size_t const dot = name.rfind('.');
+   if (dot == std::string::npos)
+      return nullptr;
+   InteractionClass const* declaring = interactionClassByName(name.substr(0, dot));
+   if (declaring == nullptr)
+      return nullptr;
+   for (InteractionClass const* c = interactionClass(classHandle); c;
+        c = c->parent ? interactionClass(c->parent) : nullptr)
+      if (c == declaring)
+         for (std::uint64_t h : c->parameters)
+            if (_parameters.at(h).name == name.substr(dot + 1))
+               return &_parameters.at(h);
    return nullptr;
 }
 

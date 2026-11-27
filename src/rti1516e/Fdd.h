@@ -55,6 +55,9 @@ public:
       std::string qualified; // HLAobjectRoot.A.B
       std::uint64_t parent = 0;
       std::vector<std::uint64_t> attributes; // declared by this class
+      // Module that defined the attributes ("" while only scaffolding: a
+      // module may name the class without attributes, to place subclasses).
+      std::string definedBy;
    };
    struct Parameter
    {
@@ -69,6 +72,7 @@ public:
       std::string qualified;
       std::uint64_t parent = 0;
       std::vector<std::uint64_t> parameters; // declared by this class
+      std::string definedBy;                 // module that defined the parameters
       std::string transportation = "HLAreliable";
       std::string order = "Receive";
       std::vector<std::string> dimensions;
@@ -88,10 +92,12 @@ public:
    void merge(std::string const& xmlDocument, std::string const& label);
 
    ObjectClass const* objectClass(std::uint64_t handle) const;
-   // Accepts "HLAobjectRoot.A.B" or "A.B".
+   // Accepts "HLAobjectRoot.A.B", "A.B", or a unique suffix ("B").
    ObjectClass const* objectClassByName(std::string const& name) const;
    Attribute const* attribute(std::uint64_t handle) const;
-   // Looks in the class and its ancestors.
+   // Looks in the class and its ancestors. A qualified name
+   // ("HLAobjectRoot.A.Attr", "A.Attr") names the declaring class, which must
+   // be the class or one of its ancestors.
    Attribute const* findAttribute(std::uint64_t classHandle, std::string const& name) const;
    bool classHasAttribute(std::uint64_t classHandle, std::uint64_t attributeHandle) const;
 

@@ -75,6 +75,10 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - `tests/tls/main.cpp` : `hla-tls-test` (broker TLS décrit par `HLA_MQTT_TLS_DIR`, sinon code 77 = ignoré).
 - `tests/robustness/main.cpp` : `hla-robustness-test` (broker requis, lié aussi à Paho : client brut qui
   reprend un clientId ; se relance avec `--child` pour un fédéré tué sans resign).
+- `tests/load/` : `hla-load` (un fédéré par processus, FOM `LoadFom.xml`), piloté par `tools/hla_load.py`
+  (`run` : test de charge multi-processus/multi-machines, ctest `multiprocess*` ; `bench` : docs/performance.md).
+- `conformance/openrti/` : tests d'OpenRTI compilés contre ce RTI si `-DHLA_MQTT_OPENRTI_SOURCE_DIR=...`
+  (label ctest `openrti`, sources copiées et adaptées à la configuration ; voir conformance/README.md).
 - `mim/HLAstandardMIM.xml` : MIM standard intégré à la DLL (tableau d'octets généré par `cmake/EmbedFile.cmake`).
 
 ## État au 2026-11-23
@@ -129,6 +133,15 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
 - **Issues #7 à #12** (2026-11-25) : retract/requestRetraction, change*OrderType, changement et requête de
   transport, getUpdateRateValueForAttribute. `hla-time-test` 63/63, `hla-objects-test` 72/72 en Release.
 
+- **Issues #42 à #44** (2026-11-26) : suite OpenRTI (51 tests, 50 verts, concurrent-time-L0-N5 désactivé), défauts corrigés : extension concurrente du
+  FDD au join, destroy concurrent d'un create, monotonie HLAfloat64Time, noms qualifiés/suffixes, URL `data:`,
+  règle de définition identique, callbacks filtrés à la livraison après unsubscribe, nom déjà détenu
+  re-réservé, points de synchronisation annoncés aux fédérés qui joignent avant la synchronisation,
+  demande de régulation/contrainte en attente jusqu'à la livraison du callback, temps d'activation de la
+  régulation après un accord TAR/NER fermé, coupe cohérente avec les régulateurs qui n'avancent pas.
+  Suite complète Release 64/64 (broker configuré comme broker/mosquitto-hla.conf).
+  `hla-load` + `tools/hla_load.py` (charge multi-processus, banc de performance).
+
 ## Essai VR-Link 5.4 (C:\MAKrlink5.4-netUtilitiesin64)
 - f18HLA1516e_64 + netdumpHLA1516e_64 fonctionnent sur notre RTI (découverte, 45 attributs RPR reçus),
   sans `--ignoreAdvisories` depuis les avis (2026-11-24).
@@ -166,6 +179,10 @@ doit pouvoir charger `rti1516e.dll` sans recompilation.
   Toujours `set(X "${Y}")` et `if("${X}" ...)`.
 - Paho C : une connexion qui suit de près une déconnexion (même avec un autre handle) attend ~1 s. D'où la
   session propre plutôt qu'une session persistante purgée par une connexion supplémentaire.
+- Les tests OpenRTI répètent leur scénario 99 fois (`HLA_OPENRTI_ITERATIONS` pour réduire) ; les points de
+  synchronisation à N fédérés coûtent N³ réceptions par étape : tests à 10 fédérés lents, pas bloqués.
+- Un callback en file peut être livré après un désabonnement ou une suppression : filtrer à la livraison
+  avec l'état capturé à la mise en file (l'objet peut avoir été supprimé par un message suivant).
 
 ## Suite prévue
 1. `check_imports.py` sur un vrai fédéré (selftest Windows validé).

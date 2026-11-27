@@ -104,6 +104,25 @@ std::uint64_t MqttRTIambassador::receivedInteractionClass(std::uint64_t interact
    return 0;
 }
 
+bool MqttRTIambassador::stillReceives(std::uint64_t interaction, std::uint64_t received)
+{
+   std::lock_guard<std::mutex> v(_viewMutex);
+   return receivedInteractionClass(interaction) == received;
+}
+
+// `knownClass`: the class the object was known as when the update was queued
+// (the object itself may be removed since, by a delete queued after it).
+bool MqttRTIambassador::keepSubscribed(std::uint64_t knownClass, AttributeHandleValueMap& values)
+{
+   std::lock_guard<std::mutex> v(_viewMutex);
+   auto sub = _subscribedAttributes.find(knownClass);
+   if (sub == _subscribedAttributes.end())
+      return false;
+   for (auto it = values.begin(); it != values.end();)
+      it = sub->second.count(AttributeHandleFriend::value(it->first)) ? std::next(it) : values.erase(it);
+   return !values.empty();
+}
+
 bool MqttRTIambassador::seenBefore(std::uint64_t sender, std::uint64_t seq)
 {
    auto key = std::make_pair(sender, seq);
@@ -404,23 +423,28 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          VariableLengthData const t = toVld(tag);
          TransportationType const tt = allBestEffort ? BEST_EFFORT : RELIABLE;
          SupplementalReflectInfo const info = reflectInfo(sender);
+         std::uint64_t const knownClass = o.knownClass;
          std::shared_ptr<LogicalTime> lt = timeFlag ? decodeTime(time) : nullptr;
          if (lt && timeFlag == 2)
          {
             MessageRetractionHandle const mrh = MessageRetractionHandleFriend::create(retraction);
             deliverTimed(TimeValue::of(*lt, timeIsInteger()), true,
-                         [h, values, t, tt, lt, mrh, info](FederateAmbassador& fa, OrderType received) {
-                            fa.reflectAttributeValues(h, values, t, TIMESTAMP, tt, *lt, received, mrh, info);
+                         [this, knownClass, h, values, t, tt, lt, mrh, info](FederateAmbassador& fa,
+                                                                           OrderType received) mutable {
+                            if (keepSubscribed(knownClass, values))
+                               fa.reflectAttributeValues(h, values, t, TIMESTAMP, tt, *lt, received, mrh, info);
                          },
                          retraction);
          }
          else if (lt)
-            deliverRO([h, values, t, tt, lt, info](FederateAmbassador& fa) {
-               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
+            deliverRO([this, knownClass, h, values, t, tt, lt, info](FederateAmbassador& fa) mutable {
+               if (keepSubscribed(knownClass, values))
+                  fa.reflectAttributeValues(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
             });
          else
-            deliverRO([h, values, t, tt, info](FederateAmbassador& fa) {
-               fa.reflectAttributeValues(h, values, t, RECEIVE, tt, info);
+            deliverRO([this, knownClass, h, values, t, tt, info](FederateAmbassador& fa) mutable {
+               if (keepSubscribed(knownClass, values))
+                  fa.reflectAttributeValues(h, values, t, RECEIVE, tt, info);
             });
          return;
       }
@@ -462,18 +486,22 @@ void MqttRTIambassador::handleObjectTraffic(std::string const& rest, std::string
          {
             MessageRetractionHandle const mrh = MessageRetractionHandleFriend::create(retraction);
             deliverTimed(TimeValue::of(*lt, timeIsInteger()), true,
-                         [h, values, t, tt, lt, mrh, info](FederateAmbassador& fa, OrderType receivedOrder) {
-                            fa.receiveInteraction(h, values, t, TIMESTAMP, tt, *lt, receivedOrder, mrh, info);
+                         [this, cls, received, h, values, t, tt, lt, mrh, info](FederateAmbassador& fa,
+                                                                                OrderType receivedOrder) {
+                            if (stillReceives(cls, received))
+                               fa.receiveInteraction(h, values, t, TIMESTAMP, tt, *lt, receivedOrder, mrh, info);
                          },
                          retraction);
          }
          else if (lt)
-            deliverRO([h, values, t, tt, lt, info](FederateAmbassador& fa) {
-               fa.receiveInteraction(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
+            deliverRO([this, cls, received, h, values, t, tt, lt, info](FederateAmbassador& fa) {
+               if (stillReceives(cls, received))
+                  fa.receiveInteraction(h, values, t, RECEIVE, tt, *lt, RECEIVE, info);
             });
          else
-            deliverRO([h, values, t, tt, info](FederateAmbassador& fa) {
-               fa.receiveInteraction(h, values, t, RECEIVE, tt, info);
+            deliverRO([this, cls, received, h, values, t, tt, info](FederateAmbassador& fa) {
+               if (stillReceives(cls, received))
+                  fa.receiveInteraction(h, values, t, RECEIVE, tt, info);
             });
          return;
       }
@@ -776,9 +804,15 @@ void MqttRTIambassador::reserveNames(std::set<std::wstring> const& names, bool m
 
    std::string const ft = _fedTopic;
    std::string const myId = _transport->settings().clientId;
+   // A name this federate already holds stays reserved: only the other names
+   // go through the claim protocol (whose withdrawal would drop our record).
    std::vector<std::string> topics;
-   for (std::wstring const& n : names)
-      topics.push_back(ft + "/names/" + encodeTopicLevel(toUtf8(n)));
+   {
+      std::lock_guard<std::mutex> v(_viewMutex);
+      for (std::wstring const& n : names)
+         if (!_reservedNames.count(n))
+            topics.push_back(ft + "/names/" + encodeTopicLevel(toUtf8(n)));
+   }
 
    auto claim = [&](std::string const& state) {
       Json j = Json::object();
@@ -815,12 +849,12 @@ void MqttRTIambassador::reserveNames(std::set<std::wstring> const& names, bool m
       return worst;
    };
 
-   bool success = false;
+   bool success = topics.empty();
    try
    {
       for (std::string const& t : topics)
          _transport->subscribe(t + "/+");
-      for (int attempt = 0; attempt < kReservationAttempts; ++attempt)
+      for (int attempt = 0; !success && attempt < kReservationAttempts; ++attempt)
       {
          _transport->barrier();
          if (others() == 2)

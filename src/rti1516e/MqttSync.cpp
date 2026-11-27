@@ -1,7 +1,7 @@
 // Federation synchronization points (IEEE 1516.1-2010, 4.11 to 4.15).
 //
 // Topics under the joined federation F (label percent-encoded):
-//   F/sync/<label>/point            retained {"label","tag","members":[hex],"registrant"}
+//   F/sync/<label>/point            retained {"label","tag","members":[hex],"registrant","whole"}
 //   F/sync/<label>/claims/<client>  label claim during the registration (transient)
 //   F/sync/<label>/achieved/<hex>   retained {"success":bool}
 //
@@ -10,8 +10,12 @@
 // it, or has left the federation (resigned or vanished). The registrant (or,
 // if it is gone, the live member with the smallest handle) then clears the
 // records, which makes the label available again.
-// The synchronization set is fixed at registration: the joined federates, or
-// the given set.
+// The synchronization set is the given set, or, without one, the whole
+// federation: the federates joined at registration, plus the ones that join
+// before the point is synchronized (they find the retained point record and
+// are announced the point, as with the usual 1516 RTIs). A member that sees
+// the records cleared before it has seen the synchronization (it joined while
+// the others concluded) is told the point is synchronized.
 
 #include "MqttRTIambassador.h"
 
@@ -154,6 +158,7 @@ void MqttRTIambassador::registerFederationSynchronizationPoint(std::wstring cons
          point.set("tag", toHexBytes(theUserSuppliedTag.data(), theUserSuppliedTag.size()));
          point.set("members", m);
          point.set("registrant", hex64(_federateHandle));
+         point.set("whole", synchronizationSet.empty());
          // Succeeded is queued before the announcement (delivered by the broker).
          enqueue([label](FederateAmbassador& fa) { fa.synchronizationPointRegistrationSucceeded(label); });
          _transport->publish(base + "/point", point.dump(), 1, true);
@@ -211,20 +216,33 @@ void MqttRTIambassador::handleSyncTraffic(std::string const& rest, std::string c
       {
          if (payload.empty())
          {
-            _syncPoints.erase(key); // cleared after synchronization: label free again
+            // Cleared after synchronization: label free again.
+            auto it = _syncPoints.find(key);
+            if (it != _syncPoints.end() && it->second.announced && !it->second.synchronized)
+            {
+               std::wstring const label = it->second.label;
+               enqueue([label](FederateAmbassador& fa) { fa.federationSynchronized(label, FederateHandleSet()); });
+            }
+            _syncPoints.erase(key);
             return;
          }
          Json j = Json::parse(payload);
          SyncPoint& sp = _syncPoints[key];
-         if (sp.known)
-            return;
-         sp.known = true;
-         sp.label = fromUtf8(j["label"].str());
-         sp.tag = fromHexBytes(j["tag"].str());
-         sp.registrant = std::strtoull(j["registrant"].str().c_str(), nullptr, 16);
-         for (std::string const& h : j["members"].strings())
-            sp.members.insert(std::strtoull(h.c_str(), nullptr, 16));
-         if (sp.members.count(_federateHandle))
+         if (!sp.known)
+         {
+            sp.known = true;
+            sp.label = fromUtf8(j["label"].str());
+            sp.tag = fromHexBytes(j["tag"].str());
+            sp.registrant = std::strtoull(j["registrant"].str().c_str(), nullptr, 16);
+            for (std::string const& h : j["members"].strings())
+               sp.members.insert(std::strtoull(h.c_str(), nullptr, 16));
+            sp.whole = j["whole"].boolean(); // false in records without it
+         }
+         if (_federateHandle == 0)
+            return; // joining: the record comes again once joined
+         if (sp.whole && !sp.synchronized)
+            sp.members.insert(_federateHandle); // joined after the registration, if not already in
+         if (!sp.announced && sp.members.count(_federateHandle))
          {
             sp.announced = true;
             std::wstring const label = sp.label;
@@ -255,8 +273,11 @@ void MqttRTIambassador::evaluateSync(std::string const& key, SyncPoint& sp)
    if (!sp.known || sp.synchronized)
       return;
    std::set<std::uint64_t> const live = liveFederateHandles();
+   std::set<std::uint64_t> members = sp.members;
+   if (sp.whole)
+      members.insert(live.begin(), live.end()); // late joiners
    FederateHandleSet failed;
-   for (std::uint64_t m : sp.members)
+   for (std::uint64_t m : members)
    {
       auto it = sp.achieved.find(m);
       if (it == sp.achieved.end())

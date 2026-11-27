@@ -307,10 +307,40 @@ if(HLA_MQTT_RTI_BUILD_TESTS)
   endif()
   add_test(NAME robustness COMMAND hla-robustness-test)
 
+  # Load and performance (#42, #43): one federate per process, driven by
+  # tools/hla_load.py (several processes, several machines). Needs a broker.
+  # multiprocess: 750 updates per receiver, within the default queue of a broker (1000).
+  add_executable(hla-load tests/load/main.cpp)
+  target_link_libraries(hla-load PRIVATE rti1516e)
+  target_compile_definitions(hla-load PRIVATE HLA_LOAD_FOM="${CMAKE_CURRENT_SOURCE_DIR}/tests/load/LoadFom.xml")
+  if(MSVC)
+    target_compile_options(hla-load PRIVATE /W3 /EHsc /utf-8 /wd4251 /wd4275)
+    set_property(TARGET hla-load PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME multiprocess
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/hla_load.py run
+                     --exe $<TARGET_FILE:hla-load> --federation HlaLoadCtest --federates 6
+                     --objects 10 --attributes 8 --updates 15)
+    add_test(NAME multiprocess-pingpong
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/hla_load.py run
+                     --exe $<TARGET_FILE:hla-load> --federation HlaLoadCtestPing --federates 3
+                     --mode pingpong --count 200)
+    set_tests_properties(multiprocess multiprocess-pingpong PROPERTIES LABELS multiprocess TIMEOUT 300)
+  endif()
+
   if(TARGET hla-pe-linker-version)
     add_test(NAME pe-linker-version COMMAND hla-pe-linker-version --check $<TARGET_FILE:rti1516e> ${HLA_MQTT_PE_VERSION})
     add_test(NAME pe-linker-version-fedtime
              COMMAND hla-pe-linker-version --check $<TARGET_FILE:fedtime1516e> ${HLA_MQTT_PE_VERSION})
+  endif()
+
+  # Conformance tests of OpenRTI (#44), built against this RTI: needs an
+  # OpenRTI source tree and a broker (conformance/README.md).
+  set(HLA_MQTT_OPENRTI_SOURCE_DIR "" CACHE PATH "OpenRTI source tree: builds its rti1516e tests against this RTI")
+  if(HLA_MQTT_OPENRTI_SOURCE_DIR)
+    add_subdirectory(conformance/openrti)
   endif()
 endif()
 

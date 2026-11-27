@@ -211,6 +211,11 @@ private:
    void updateBrokerSubscriptions();
    std::uint64_t knownObjectClass(std::uint64_t objectClass) const;      // _viewMutex
    std::uint64_t receivedInteractionClass(std::uint64_t interaction) const; // _viewMutex
+   // Federate thread, no lock held: the subscriptions may have changed since
+   // the message was queued (IEEE 1516.1-2010 5.7, 5.9: no callback for an
+   // unsubscribed class or attribute once the service has returned).
+   bool stillReceives(std::uint64_t interaction, std::uint64_t received);
+   bool keepSubscribed(std::uint64_t knownClass, AttributeHandleValueMap& values);
    bool isSubclassOf(std::uint64_t objectClass, std::uint64_t ancestor) const;
    bool seenBefore(std::uint64_t sender, std::uint64_t seq);
    std::uint64_t nextSeq() { return ++_seq; }
@@ -379,6 +384,7 @@ private:
       std::string tag;
       std::set<std::uint64_t> members;
       std::uint64_t registrant = 0;
+      bool whole = false;        // registered without a set: late joiners are members too
       bool known = false;        // point record received
       bool announced = false;    // announced to this federate
       bool achievedSent = false;
@@ -468,6 +474,7 @@ private:
       bool regulating = false, regPending = false, constrained = false, conPending = false;
       TimeValue time, lookahead, requested, queueMin, promise;
       bool promiseOpen = false;
+      bool grantClosed = false; // last grant through TAR/NER: no TSO message at its time any more
       Advance advance = Advance::None;
       std::map<std::uint64_t, std::uint64_t> seen; // federate -> version seen
    };
@@ -477,7 +484,7 @@ private:
       bool asyncDelivery = false;
       TimeValue time, lookahead, requested;
       Advance advance = Advance::None;
-      bool lastGrantOpen = true; // zero lookahead after TAR/NER grant: sends > time
+      bool lastGrantOpen = false; // last grant through TAR/NER (zero lookahead: sends > time)
       std::uint64_t version = 0;
       std::uint64_t regPendingVersion = 0;
       // Enablement completes only after a broker round trip following the
@@ -485,6 +492,12 @@ private:
       // the other, whatever the order of concurrent requests.
       bool regBarrierDone = false;
       bool conBarrierDone = false;
+      // IEEE 1516.1-2010 8.2, 8.4: the request stays pending until the
+      // timeRegulationEnabled / timeConstrainedEnabled callback is delivered.
+      bool regNotified = true;
+      bool conNotified = true;
+      bool regRequestPending() const { return regPending || !regNotified; }
+      bool conRequestPending() const { return conPending || !conNotified; }
       Bound promiseFloor;          // published promises never go down
       bool promiseFloorSet = false;
       std::string lastPublished;   // last payload, to republish only on change

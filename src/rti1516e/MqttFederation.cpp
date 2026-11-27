@@ -33,6 +33,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <thread>
 
@@ -53,9 +54,66 @@ bool startsWith(std::string const& s, std::string const& prefix)
    return s.compare(0, prefix.size(), prefix) == 0;
 }
 
-// FOM/MIM designator: a file path or a file: URL. Returns the octets.
+// data: URL (RFC 2397): "data:[<media type>][;base64],<data>".
+std::string readDataUrl(std::string const& url)
+{
+   size_t const comma = url.find(',');
+   if (comma == std::string::npos)
+      throw std::runtime_error("malformed data: URL (no ',')");
+   std::string const header = url.substr(5, comma - 5);
+   std::string const data = url.substr(comma + 1);
+   std::string out;
+   bool const base64 = header.size() >= 7 && header.compare(header.size() - 7, 7, ";base64") == 0;
+   auto hexValue = [](char c) -> int {
+      if (c >= '0' && c <= '9')
+         return c - '0';
+      if (c >= 'a' && c <= 'f')
+         return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F')
+         return c - 'A' + 10;
+      return -1;
+   };
+   if (base64)
+   {
+      std::string const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      unsigned bits = 0;
+      int count = 0;
+      for (char c : data)
+      {
+         if (c == '=' || c == ' ' || c == '\r' || c == '\n' || c == '\t')
+            continue;
+         size_t const v = alphabet.find(c);
+         if (v == std::string::npos)
+            throw std::runtime_error("malformed data: URL (invalid base64)");
+         bits = (bits << 6) | unsigned(v);
+         count += 6;
+         if (count >= 8)
+         {
+            count -= 8;
+            out += char((bits >> count) & 0xff);
+         }
+      }
+      return out;
+   }
+   // Percent-decoding; anything else (raw XML, as some RTIs send) is kept.
+   for (size_t i = 0; i < data.size(); ++i)
+   {
+      if (data[i] == '%' && i + 2 < data.size() && hexValue(data[i + 1]) >= 0 && hexValue(data[i + 2]) >= 0)
+      {
+         out += char(hexValue(data[i + 1]) * 16 + hexValue(data[i + 2]));
+         i += 2;
+      }
+      else
+         out += data[i];
+   }
+   return out;
+}
+
+// FOM/MIM designator: a file path, a file: URL or a data: URL. Returns the octets.
 std::string readModule(std::wstring const& designator)
 {
+   if (designator.compare(0, 5, L"data:") == 0)
+      return readDataUrl(toUtf8(designator));
    std::wstring path = designator;
    if (path.compare(0, 8, L"file:///") == 0)
    {
@@ -67,7 +125,7 @@ std::string readModule(std::wstring const& designator)
    else if (path.compare(0, 7, L"file://") == 0)
       path = path.substr(7);
    else if (path.find(L"://") != std::wstring::npos)
-      throw std::runtime_error("unsupported designator (only files): " + toUtf8(designator));
+      throw std::runtime_error("unsupported designator (files and data: URLs only): " + toUtf8(designator));
 
    std::ifstream in(std::filesystem::path(path), std::ios::binary);
    if (!in)
@@ -100,9 +158,10 @@ Module standardMimModule()
 Module loadModule(std::wstring const& designator)
 {
    Module m;
-   m.label = toUtf8(designator);
    m.content = readModule(designator);
    m.hash = hex64(fnv1a64(m.content));
+   // A data: URL is the module itself: named by its hash, not by its text.
+   m.label = designator.compare(0, 5, L"data:") == 0 ? "data:" + m.hash : toUtf8(designator);
    return m;
 }
 
@@ -366,8 +425,6 @@ void MqttRTIambassador::createFederation(std::wstring const& federationName,
       }
       modules.push_back(m);
    }
-   if (fomModules.empty())
-      throw CouldNotOpenFDD(L"no FOM module given");
    for (std::wstring const& d : fomModules)
    {
       Module m;
@@ -528,28 +585,83 @@ void MqttRTIambassador::destroyFederationExecution(std::wstring const& federatio
       }
    };
 
+   // The destroyer holds the name claim of createFederationExecution while it
+   // removes the records: a creation of the same name cannot interleave (it
+   // would publish its FOM modules, then see them removed).
+   std::string const claimTopic = ft + "/claims/" + encodeTopicLevel(_transport->settings().clientId);
+   bool claimed = false;
+   auto release = [&] {
+      if (claimed)
+      {
+         claimed = false;
+         _transport->publish(claimTopic, std::string(), 1, true);
+      }
+   };
+
    try
    {
       _transport->subscribe(ft + "/#");
-      _transport->barrier();
       std::string execution;
       bool joined = false;
+      for (int attempt = 0;; ++attempt)
       {
-         std::lock_guard<std::mutex> v(_viewMutex);
-         auto it = _view.find(ft + "/execution");
-         if (it != _view.end())
-            execution = it->second;
-         joined = !liveFederates(ft).empty();
-      }
-      if (execution.empty())
-      {
-         cleanup();
-         throw FederationExecutionDoesNotExist(federationExecutionName);
-      }
-      if (joined)
-      {
-         cleanup();
-         throw FederatesCurrentlyJoined(federationExecutionName);
+         _transport->barrier();
+         {
+            std::lock_guard<std::mutex> v(_viewMutex);
+            auto it = _view.find(ft + "/execution");
+            execution = it != _view.end() ? it->second : std::string();
+            joined = !liveFederates(ft).empty();
+         }
+         if (execution.empty())
+         {
+            release();
+            cleanup();
+            throw FederationExecutionDoesNotExist(federationExecutionName);
+         }
+         if (joined)
+         {
+            release();
+            cleanup();
+            throw FederatesCurrentlyJoined(federationExecutionName);
+         }
+         if (claimed)
+            break; // checked under our claim
+         Json claim = Json::object();
+         claim.set("clientId", _transport->settings().clientId);
+         _transport->publish(claimTopic, claim.dump(), 1, true);
+         claimed = true;
+         _transport->barrier();
+         bool contended = false;
+         {
+            std::lock_guard<std::mutex> v(_viewMutex);
+            for (auto const& kv : recordsUnder(ft + "/claims/"))
+            {
+               if (kv.first == claimTopic)
+                  continue;
+               std::string other;
+               try
+               {
+                  other = Json::parse(kv.second)["clientId"].str();
+               }
+               catch (std::exception const&)
+               {
+               }
+               if (clientAlive(other))
+                  contended = true;
+            }
+         }
+         if (contended)
+         {
+            release();
+            if (attempt + 1 >= kMaxAttempts)
+            {
+               cleanup();
+               throw RTIinternalError(L"destroyFederationExecution: too much contention on " +
+                                      federationExecutionName);
+            }
+            backoff(attempt);
+         }
+         // else: loop once more to check the records under the claim
       }
       // Remove the execution record, then check again: a federate joining
       // concurrently either shows up now, or will see the record gone.
@@ -564,11 +676,14 @@ void MqttRTIambassador::destroyFederationExecution(std::wstring const& federatio
       if (joined)
       {
          _transport->publish(ft + "/execution", execution, 1, true);
+         release();
          cleanup();
          throw FederatesCurrentlyJoined(federationExecutionName);
       }
       for (auto const& kv : leftovers) // FOM modules, stale federates and claims
-         _transport->publish(kv.first, std::string(), 1, true);
+         if (kv.first != claimTopic)
+            _transport->publish(kv.first, std::string(), 1, true);
+      release();
       _transport->barrier();
       cleanup();
    }
@@ -673,56 +788,144 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
 
       // FDD of the federation: modules of the execution record first, then
       // the modules added by joined federates, then ours.
-      std::shared_ptr<Fdd> fdd = std::make_shared<Fdd>();
+      std::shared_ptr<Fdd> fdd;
       std::set<std::string> merged;
       std::wstring timeName;
-      std::string execution;
-      std::map<std::string, std::string> foms;
-      {
-         std::lock_guard<std::mutex> v(_viewMutex);
-         auto it = _view.find(ft + "/execution");
-         if (it != _view.end())
-            execution = it->second;
-         foms = recordsUnder(ft + "/fom/");
-      }
-      if (execution.empty())
-      {
-         abandon();
-         throw FederationExecutionDoesNotExist(federationName);
-      }
-      Json exec = Json::parse(execution);
-      timeName = fromUtf8(exec["timeImplementation"].str());
-      std::vector<std::string> order = exec["modules"].strings();
-      for (auto const& kv : foms)
-      {
-         std::string const h = kv.first.substr(ft.size() + 5);
-         if (std::find(order.begin(), order.end(), h) == order.end())
-            order.push_back(h);
-      }
-      for (std::string const& h : order)
-      {
-         auto m = foms.find(ft + "/fom/" + h);
-         if (m == foms.end())
+      bool extending = false; // we bring modules the federation does not have
+      auto buildFdd = [&] {
+         fdd = std::make_shared<Fdd>();
+         merged.clear();
+         std::string execution;
+         std::map<std::string, std::string> foms;
+         {
+            std::lock_guard<std::mutex> v(_viewMutex);
+            auto it = _view.find(ft + "/execution");
+            if (it != _view.end())
+               execution = it->second;
+            foms = recordsUnder(ft + "/fom/");
+         }
+         if (execution.empty())
          {
             abandon();
-            throw RTIinternalError(L"FOM module " + fromUtf8(h) + L" of the federation is missing");
+            throw FederationExecutionDoesNotExist(federationName);
          }
-         if (merged.insert(h).second)
-            fdd->merge(m->second, "module " + h);
-      }
-      for (Module const& m : extra)
+         Json exec = Json::parse(execution);
+         timeName = fromUtf8(exec["timeImplementation"].str());
+         std::vector<std::string> order = exec["modules"].strings();
+         for (auto const& kv : foms)
+         {
+            std::string const h = kv.first.substr(ft.size() + 5);
+            if (std::find(order.begin(), order.end(), h) == order.end())
+               order.push_back(h);
+         }
+         for (std::string const& h : order)
+         {
+            auto m = foms.find(ft + "/fom/" + h);
+            if (m == foms.end())
+            {
+               abandon();
+               throw RTIinternalError(L"FOM module " + fromUtf8(h) + L" of the federation is missing");
+            }
+            if (merged.insert(h).second)
+               fdd->merge(m->second, "module " + h);
+         }
+         extending = false;
+         for (Module const& m : extra)
+         {
+            try
+            {
+               if (merged.insert(m.hash).second)
+               {
+                  extending = true;
+                  fdd->merge(m.content, m.label);
+               }
+            }
+            catch (FddError const& e)
+            {
+               abandon();
+               throwFddError(e, false);
+            }
+         }
+      };
+      buildFdd();
+
+      // New modules: one joining federate at a time extends the FOM, so that
+      // two concurrent joins cannot add modules inconsistent with each other
+      // (each checked only against the modules published before it). The
+      // lock is a claim, like a federation name; released once our modules
+      // are published (or on failure).
+      std::string const fomClaim = ft + "/fomclaims/" + encodeTopicLevel(myId);
+      bool fomLocked = false;
+      auto releaseFomLock = [&] {
+         if (fomLocked)
+         {
+            fomLocked = false;
+            try
+            {
+               _transport->publish(fomClaim, std::string(), 1, true);
+            }
+            catch (std::runtime_error const&)
+            {
+            }
+         }
+      };
+      struct FomLockGuard
       {
+         std::function<void()> release;
+         ~FomLockGuard() { release(); }
+      } fomLockGuard{releaseFomLock}; // any exit, exceptions included
+      if (extending)
+      {
+         int const kFomAttempts = 64;
+         for (int attempt = 0;; ++attempt)
+         {
+            Json claim = Json::object();
+            claim.set("clientId", myId);
+            _transport->publish(fomClaim, claim.dump(), 1, true);
+            fomLocked = true;
+            _transport->barrier();
+            bool contended = false;
+            {
+               std::lock_guard<std::mutex> v(_viewMutex);
+               for (auto const& kv : recordsUnder(ft + "/fomclaims/"))
+               {
+                  if (kv.first == fomClaim)
+                     continue;
+                  std::string other;
+                  try
+                  {
+                     other = Json::parse(kv.second)["clientId"].str();
+                  }
+                  catch (std::exception const&)
+                  {
+                  }
+                  if (clientAlive(other))
+                     contended = true;
+               }
+            }
+            if (!contended)
+               break;
+            releaseFomLock();
+            if (attempt + 1 >= kFomAttempts)
+            {
+               abandon();
+               throw RTIinternalError(L"joinFederationExecution: too much contention on the FOM of " + federationName);
+            }
+            backoff(attempt < 8 ? attempt : 8);
+            _transport->barrier();
+         }
+         // Modules published by the federates that held the lock before us.
          try
          {
-            if (merged.insert(m.hash).second)
-               fdd->merge(m.content, m.label);
+            buildFdd();
          }
-         catch (FddError const& e)
+         catch (...)
          {
-            abandon();
-            throwFddError(e, false);
+            releaseFomLock();
+            throw;
          }
       }
+
       if (!HLAlogicalTimeFactoryFactory::makeLogicalTimeFactory(timeName).get())
       {
          abandon();
@@ -757,6 +960,7 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
          }
          if (taken)
          {
+            releaseFomLock();
             abandon();
             throw FederateNameAlreadyInUse(fromUtf8(name));
          }
@@ -776,6 +980,7 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
          if (!stillExists)
          {
             _transport->publish(recordTopic, std::string(), 1, true);
+            releaseFomLock();
             abandon();
             throw FederationExecutionDoesNotExist(federationName);
          }
@@ -784,6 +989,7 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
          _transport->publish(recordTopic, std::string(), 1, true);
          if (attempt + 1 >= kMaxAttempts)
          {
+            releaseFomLock();
             abandon();
             throw RTIinternalError(L"joinFederationExecution: too much contention on the name " + fromUtf8(name));
          }
@@ -793,6 +999,7 @@ FederateHandle MqttRTIambassador::joinFederation(std::wstring const& federateNam
 
       for (Module const& m : extra)
          _transport->publish(ft + "/fom/" + m.hash, m.content, 1, true);
+      releaseFomLock(); // after our modules, in publication order
       record.set("state", "joined");
       _transport->publish(recordTopic, record.dump(), 1, true);
 

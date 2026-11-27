@@ -100,14 +100,20 @@ struct FloatPolicy
       return os.str();
    }
    static bool valid(T v) { return v >= 0.0 && v <= DBL_MAX; } // false for NaN
+   // T + I > T and T - I < T for every I > 0 (IEEE 1516.1-2010 12.1): when the
+   // increment is lost in rounding, the result is the next representable value.
    static bool add(T a, T b, T& r)
    {
       r = a + b;
+      if (b > 0.0 && r <= a)
+         r = std::nextafter(a, std::numeric_limits<double>::infinity());
       return valid(r);
    }
    static bool sub(T a, T b, T& r)
    {
       r = a - b;
+      if (b > 0.0 && r >= a)
+         r = std::nextafter(a, -std::numeric_limits<double>::infinity());
       return valid(r);
    }
 };

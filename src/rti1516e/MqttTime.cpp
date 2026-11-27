@@ -116,6 +116,7 @@ void MqttRTIambassador::handleTimeState(std::string const& hexHandle, std::strin
          s.queueMin = TimeValue::parse(j["q"].str(), isInt);
          s.promise = TimeValue::parse(j["p"].str(), isInt);
          s.promiseOpen = j["po"].boolean();
+         s.grantClosed = j["gc"].boolean();
          for (auto const& kv : j["seen"].members())
             s.seen[std::strtoull(kv.first.c_str(), nullptr, 16)] = std::strtoull(kv.second.str().c_str(), nullptr, 10);
          _timeStates[h] = s;
@@ -141,10 +142,14 @@ bool MqttRTIambassador::snapshot(TimeValue& minNext) const
 
    auto isWaiting = [](Advance a) { return a == Advance::TAR || a == Advance::TARA || a == Advance::NER || a == Advance::NERA; };
    minNext = TimeValue::inf(timeIsInteger());
+   // A regulating federate that is not waiting for a grant takes part with
+   // its promise (its next message cannot come earlier): without it, a
+   // federate enabling time constraint before its first request would wait
+   // for the others' promises, which wait for the cut.
    for (auto const& r : reg)
    {
       TimeState const& s = *r.second;
-      if (s.regPending || !isWaiting(s.advance))
+      if (s.regPending)
          return false;
       for (auto const& x : reg)
       {
@@ -161,16 +166,20 @@ bool MqttRTIambassador::snapshot(TimeValue& minNext) const
             return false;
       }
       TimeValue next = s.requested;
-      if ((s.advance == Advance::NER || s.advance == Advance::NERA) && s.queueMin < next)
+      if (!isWaiting(s.advance))
+         next = s.promise;
+      else if ((s.advance == Advance::NER || s.advance == Advance::NERA) && s.queueMin < next)
          next = s.queueMin;
       minNext = std::min(minNext, next);
    }
    if (meRegulating)
    {
-      if (_time.regPending || !isWaiting(_time.advance))
+      if (_time.regPending)
          return false;
       TimeValue next = _time.requested;
-      if ((_time.advance == Advance::NER || _time.advance == Advance::NERA) && queueMin() < next)
+      if (!isWaiting(_time.advance))
+         next = sendBound().value;
+      else if ((_time.advance == Advance::NER || _time.advance == Advance::NERA) && queueMin() < next)
          next = queueMin();
       minNext = std::min(minNext, next);
    }
@@ -188,7 +197,9 @@ bool MqttRTIambassador::galt(Bound& out) const
       if (!(s.regulating || s.regPending) || !clientAlive(s.clientId))
          continue;
       Bound b{s.promise, s.promiseOpen};
-      if (cut)
+      bool const waiting = s.advance == Advance::TAR || s.advance == Advance::TARA || s.advance == Advance::NER ||
+                           s.advance == Advance::NERA;
+      if (cut && waiting) // a federate not waiting can send at its promise now
       {
          Bound c{m.plus(s.lookahead), s.lookahead.isZero() && (s.advance == Advance::TAR || s.advance == Advance::NER)};
          if (b < c)
@@ -277,6 +288,7 @@ void MqttRTIambassador::evaluateTime()
       {
          bool ready = true;
          TimeValue newTime = _time.time;
+         bool closed = false; // a constrained federate holds a TAR/NER grant at newTime
          for (auto const& kv : _timeStates)
          {
             TimeState const& s = kv.second;
@@ -286,16 +298,36 @@ void MqttRTIambassador::evaluateTime()
             if (it == s.seen.end() || it->second < _time.regPendingVersion)
                ready = false;
             else if (s.constrained && s.time > newTime)
+            {
                newTime = s.time;
+               closed = s.grantClosed;
+            }
+            else if (s.constrained && s.time == newTime)
+               closed = closed || s.grantClosed;
          }
          if (ready)
          {
+            // Its first messages (at newTime + lookahead, or newTime with a
+            // zero lookahead) must not fall in the past of a constrained
+            // federate granted through TAR/NER at newTime.
+            if (closed && _time.lookahead.isZero())
+               newTime = newTime.next();
             _time.regPending = false;
             _time.regulating = true;
             _time.time = newTime;
-            _time.lastGrantOpen = true;
+            // Like an "available" grant: zero lookahead sends at >= time.
+            _time.lastGrantOpen = false;
+            _time.regNotified = false;
             std::shared_ptr<LogicalTime> t = newTime.toTime();
-            enqueue([t](FederateAmbassador& fa) { fa.timeRegulationEnabled(*t); });
+            enqueue([this, t](FederateAmbassador& fa) {
+               {
+                  std::lock_guard<std::mutex> v(_viewMutex);
+                  if (!_time.regulating || _time.regNotified)
+                     return; // disabled since
+                  _time.regNotified = true;
+               }
+               fa.timeRegulationEnabled(*t);
+            });
             changed = true;
          }
       }
@@ -305,8 +337,17 @@ void MqttRTIambassador::evaluateTime()
       {
          _time.conPending = false;
          _time.constrained = true;
+         _time.conNotified = false;
          std::shared_ptr<LogicalTime> t = _time.time.toTime();
-         enqueue([t](FederateAmbassador& fa) { fa.timeConstrainedEnabled(*t); });
+         enqueue([this, t](FederateAmbassador& fa) {
+            {
+               std::lock_guard<std::mutex> v(_viewMutex);
+               if (!_time.constrained || _time.conNotified)
+                  return; // disabled since
+               _time.conNotified = true;
+            }
+            fa.timeConstrainedEnabled(*t);
+         });
          changed = true;
       }
 
@@ -399,6 +440,7 @@ void MqttRTIambassador::publishTimeState(bool /*meaningful*/)
    meaning.set("q", queueMin().str());
    meaning.set("p", promise.value.str());
    meaning.set("po", promise.open);
+   meaning.set("gc", _time.lastGrantOpen);
    std::string const meaningText = meaning.dump();
    if (meaningText != _time.lastMeaning)
    {
@@ -538,16 +580,16 @@ void MqttRTIambassador::enableTimeRegulation(LogicalTimeInterval const& theLooka
    checkJoined();
    checkNotSavingOrRestoring();
    std::unique_lock<std::mutex> v(_viewMutex);
+   if (_time.regRequestPending())
+      throw RequestForTimeRegulationPending(L"time regulation request pending");
    if (_time.regulating)
       throw TimeRegulationAlreadyEnabled(L"time regulation already enabled");
-   if (_time.regPending)
-      throw RequestForTimeRegulationPending(L"time regulation request pending");
    if (_time.advance != Advance::None)
       throw InTimeAdvancingState(L"in time advancing state");
    _time.lookahead = TimeValue::ofInterval(theLookahead, timeIsInteger());
    _time.regPending = true;
    _time.regBarrierDone = false;
-   _time.lastGrantOpen = true;
+   _time.lastGrantOpen = false; // enablement: sends at >= time, as after TARA/NERA
    _time.promiseFloorSet = false;
    publishTimeState(true);
    _time.regPendingVersion = _time.version;
@@ -575,6 +617,7 @@ void MqttRTIambassador::disableTimeRegulation()
       throw TimeRegulationIsNotEnabled(L"time regulation is not enabled");
    _time.regulating = false;
    _time.regPending = false;
+   _time.regNotified = true;
    _time.promiseFloorSet = false;
    evaluateTime();
    publishTimeState(true);
@@ -586,10 +629,10 @@ void MqttRTIambassador::enableTimeConstrained()
    checkJoined();
    checkNotSavingOrRestoring();
    std::unique_lock<std::mutex> v(_viewMutex);
+   if (_time.conRequestPending())
+      throw RequestForTimeConstrainedPending(L"time constrained request pending");
    if (_time.constrained)
       throw TimeConstrainedAlreadyEnabled(L"time constrained already enabled");
-   if (_time.conPending)
-      throw RequestForTimeConstrainedPending(L"time constrained request pending");
    if (_time.advance != Advance::None)
       throw InTimeAdvancingState(L"in time advancing state");
    _time.conPending = true;
@@ -619,6 +662,7 @@ void MqttRTIambassador::disableTimeConstrained()
       throw TimeConstrainedIsNotEnabled(L"time constrained is not enabled");
    _time.constrained = false;
    _time.conPending = false;
+   _time.conNotified = true;
    // Queued TSO messages and held RO messages are delivered now (RO).
    for (auto& kv : _tsoQueue)
    {
@@ -641,9 +685,9 @@ void MqttRTIambassador::startAdvance(Advance kind, LogicalTime const& theTime)
    std::lock_guard<std::mutex> v(_viewMutex);
    if (_time.advance != Advance::None)
       throw InTimeAdvancingState(L"already in time advancing state");
-   if (_time.regPending)
+   if (_time.regRequestPending())
       throw RequestForTimeRegulationPending(L"time regulation request pending");
-   if (_time.conPending)
+   if (_time.conRequestPending())
       throw RequestForTimeConstrainedPending(L"time constrained request pending");
    TimeValue const t = TimeValue::of(theTime, timeIsInteger());
    if (t < _time.time)

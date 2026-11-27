@@ -13,6 +13,7 @@
 #include <RTI/time/HLAinteger64Time.h>
 
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +120,19 @@ struct TimeValue
                                                                                               : i + interval.i;
       else
          r.d = d + interval.d > DBL_MAX ? DBL_MAX : d + interval.d;
+      return r;
+   }
+
+   // Smallest representable value greater than this one (saturated).
+   TimeValue next() const
+   {
+      if (infinite)
+         return *this;
+      TimeValue r = *this;
+      if (integer)
+         r.i = i == std::numeric_limits<std::int64_t>::max() ? i : i + 1;
+      else
+         r.d = d >= DBL_MAX ? d : std::nextafter(d, DBL_MAX);
       return r;
    }
 
